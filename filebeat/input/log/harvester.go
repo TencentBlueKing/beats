@@ -556,7 +556,17 @@ func (h *Harvester) newLogFileReader() (reader.Reader, error) {
 		return nil, err
 	}
 
-	r, err = readfile.NewEncodeReader(reader, h.encoding, h.config.BufferSize)
+	// Configure MaxBytes limit for EncodeReader as multiplied by 4
+	// for the worst case scenario where incoming UTF32 charchers are decoded to the single byte UTF-8 characters.
+	// This limit serves primarily to avoid memory bload or potential OOM with expectedly long lines in the file.
+	// The further size limiting is performed by LimitReader at the end of the readers pipeline as needed.
+	encReaderMaxBytes := h.config.MaxBytes * 4
+
+	r, err = readfile.NewEncodeReader(reader, readfile.Config{
+		Codec:      h.encoding,
+		BufferSize: h.config.BufferSize,
+		MaxBytes:   encReaderMaxBytes,
+	})
 	if err != nil {
 		return nil, err
 	}
