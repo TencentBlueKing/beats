@@ -34,53 +34,22 @@ import (
 	"time"
 )
 
+var lines = []string{
+	"This is line 1",
+	"This is line 2",
+	"This is line 3",
+}
+
 func TestReuseReadLine(t *testing.T) {
 	absPath, err := filepath.Abs("../../tests/files/logs/")
-	// All files starting with tmp are ignored
 	logFile := absPath + "/tmp" + strconv.Itoa(rand.Int()) + ".log"
-
-	assert.NotNil(t, absPath)
-	assert.Nil(t, err)
-
+	err = genLogFile(logFile, lines)
 	if err != nil {
 		t.Fatalf("Error creating the absolute path: %s", absPath)
 	}
-
-	fd, err := os.Create(logFile)
-	if err != nil {
-		panic(err)
-	}
-	defer fd.Close()
-	defer os.Remove(logFile)
-
-	assert.Nil(t, err)
-	assert.NotNil(t, fd)
-
-	firstLineString := "9Characte"
-	secondLineString := "This is line 2"
-	thirdLineString := "This is line 3"
-
-	length, err := fd.WriteString(firstLineString + "\n")
-	assert.Nil(t, err)
-	assert.NotNil(t, length)
-
-	length, err = fd.WriteString(secondLineString + "\n")
-	assert.Nil(t, err)
-	assert.NotNil(t, length)
-
-	length, err = fd.WriteString(thirdLineString + "\n" + secondLineString + "\n")
-	assert.Nil(t, err)
-	assert.NotNil(t, length)
-	err = fd.Sync()
-	if err != nil {
-		t.Logf("write file err: %v", err)
-		return
-	}
-	_, err = os.Stat(logFile)
-	if err != nil {
-		t.Logf("get file err: %v", err)
-		return
-	}
+	defer func() {
+		os.Remove(logFile)
+	}()
 
 	wg := &sync.WaitGroup{}
 
@@ -88,10 +57,64 @@ func TestReuseReadLine(t *testing.T) {
 	wg.Add(harvesterNums)
 
 	for i := 0; i < harvesterNums; i++ {
-		go startHarvester(t, i, wg, logFile, firstLineString, secondLineString, thirdLineString)
+		go startHarvester(t, i, wg, logFile, lines)
 	}
 
 	wg.Wait()
+}
+
+func TestReuseCleanup(t *testing.T) {
+	absPath, err := filepath.Abs("../../tests/files/logs/")
+	logFile := absPath + "/tmp" + strconv.Itoa(rand.Int()) + ".log"
+	err = genLogFile(logFile, lines)
+	if err != nil {
+		t.Fatalf("Error creating the absolute path: %s", absPath)
+	}
+	h1, err := getHarvester(logFile, 0)
+	if err != nil {
+		t.Logf("harvester get reader err: %v", err)
+		return
+	}
+	fileReader, err := NewReuseHarvester(h1.id, h1.config, h1.state)
+	if err != nil {
+		panic(err)
+	}
+	os.Remove(logFile)
+	for i := 0; i <= len(lines); i++ {
+		fileReader.Next()
+	}
+	fileReaderManager.cleanup()
+}
+
+func genLogFile(logFile string, lines []string) error {
+	_, err := os.Stat(logFile)
+	if err == nil {
+		os.Remove(logFile)
+	}
+
+	fd, err := os.Create(logFile)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		fd.Close()
+	}()
+
+	for _, line := range lines {
+		_, err = fd.WriteString(line + "\n")
+		if err != nil {
+			return err
+		}
+	}
+	err = fd.Sync()
+	if err != nil {
+		return err
+	}
+	_, err = os.Stat(logFile)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func startHarvester(
@@ -99,9 +122,7 @@ func startHarvester(
 	id int,
 	wg *sync.WaitGroup,
 	logFile string,
-	firstLineString string,
-	secondLineString string,
-	thirdLineString string,
+	lines []string,
 ) {
 	var fileReader *ReuseHarvester
 	defer func() {
@@ -123,29 +144,15 @@ func startHarvester(
 	}
 	t.Logf("harvester-%d has get the reader", id)
 
-	// get first line
-	message, err := fileReader.Next()
-	assert.Equal(
-		t,
-		fmt.Sprintf("[%d]%s", id, firstLineString),
-		fmt.Sprintf("[%d]%s", id, string(message.Content)))
-	t.Logf("harvester-%d has get first line", id)
-
-	// get second line
-	message, err = fileReader.Next()
-	assert.Equal(
-		t,
-		fmt.Sprintf("[%d]%s", id, secondLineString),
-		fmt.Sprintf("[%d]%s", id, string(message.Content)))
-	t.Logf("harvester-%d has get second line", id)
-
-	// get third line
-	message, err = fileReader.Next()
-	assert.Equal(
-		t,
-		fmt.Sprintf("[%d]%s", id, thirdLineString),
-		fmt.Sprintf("[%d]%s", id, string(message.Content)))
-	t.Logf("harvester-%d has get third line", id)
+	//read lines
+	for i, line := range lines {
+		message, _ := fileReader.Next()
+		assert.Equal(
+			t,
+			fmt.Sprintf("[%d]%s", id, line),
+			fmt.Sprintf("[%d]%s", id, string(message.Content)))
+		t.Logf("harvester-%d has get %d line", id, i+1)
+	}
 	t.Logf("harvester-%d trying to stop", id)
 	fileReader.Stop()
 }

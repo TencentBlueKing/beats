@@ -108,7 +108,6 @@ func (r *ReuseHarvester) Next() (reader.Message, error) {
 	case <-r.done:
 		return reader.Message{}, ErrHarvesterDone
 	case msg := <-r.message:
-		r.State.Offset += int64(msg.message.Bytes)
 		return msg.message, msg.error
 	}
 }
@@ -212,7 +211,7 @@ func (m *FileReaderManager) cleanup() {
 			select {
 			case <-fileReaders[i].done:
 				if length != i {
-					fileReaders[i] = fileReaders[length]
+					fileReaders[i] = fileReaders[length-1]
 					length--
 					continue
 				}
@@ -382,7 +381,10 @@ func (h *FileHarvester) forward(message reader.Message, err error) {
 					logp.Err("log forward err: %v", err)
 				}
 				delete(h.forwarders, reuseReader.HarvesterID)
+				continue
 			}
+			//更新采集任务进度
+			reuseReader.State.Offset += int64(reuseMsg.message.Bytes)
 		}
 	}
 }
