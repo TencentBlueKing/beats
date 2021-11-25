@@ -18,6 +18,7 @@
 package syslog
 
 import (
+	"encoding/json"
 	"strings"
 	"sync"
 	"time"
@@ -138,12 +139,12 @@ func NewInput(
 						"truncated": metadata.Truncated,
 					},
 					Fields: common.MapStr{
-						"message": string(data),
+						"data": string(data),
 					},
 				},
 			}
 		} else {
-			event := createEvent(ev, metadata, time.Local, log)
+		    event := newCreateEvent(ev, metadata, time.Local, log)
 			d = &util.Data{Event: *event}
 		}
 
@@ -203,6 +204,73 @@ func (p *Input) Stop() {
 // Wait stops the syslog input.
 func (p *Input) Wait() {
 	p.Stop()
+}
+
+// syslog rfc3164 适配日志平台数据上报格式
+func newCreateEvent(ev *event, metadata inputsource.NetworkMetadata, timezone *time.Location, log *logp.Logger) *beat.Event {
+	la := metadata.RemoteAddr.String()
+	arr := strings.Split(la, ":")
+	ip := ""
+	port := ""
+	if len(arr) > 0 {
+		ip = arr[0]
+	}
+	if len(arr) > 1 {
+		port = arr[1]
+	}
+	f := common.MapStr{
+		"message": strings.TrimRight(ev.Message(), "\n"),
+		"log_source_ip": ip,
+		"log_source_port": port,
+	}
+
+	if ev.Hostname() != "" {
+		f["hostname"] = ev.Hostname()
+	}
+
+	if ev.HasPid() {
+		f["process_pid"] = ev.Pid()
+	}
+
+	if ev.Program() != "" {
+		f["process_program"] = ev.Program()
+	}
+
+	if ev.HasPriority() {
+		f["syslog_priority"] = ev.Priority()
+
+		f["event_severity"] = ev.Severity()
+		v, err := mapValueToName(ev.Severity(), severityLabels)
+		if err != nil {
+			log.Debugw("could not find severity label", "error", err)
+		} else {
+			f["syslog_severity_label"] = v
+		}
+
+		f["syslog_facility"] = ev.Facility()
+		v, err = mapValueToName(ev.Facility(), facilityLabels)
+		if err != nil {
+			log.Debugw("could not find facility label", "error", err)
+		} else {
+			f["syslog_facility_label"] = v
+		}
+	}
+
+	// 适配日志平台，将json转化成str
+	jf, err := json.Marshal(f)
+	if err != nil {
+		log.Error("Error starting the server", "error", err)
+		return &beat.Event{}
+	}
+	sf := string(jf)
+
+	return &beat.Event{
+		Timestamp: ev.Timestamp(timezone),
+		Meta: common.MapStr{
+			"truncated": metadata.Truncated,
+		},
+		Fields: common.MapStr{"data": sf},
+	}
 }
 
 func createEvent(ev *event, metadata inputsource.NetworkMetadata, timezone *time.Location, log *logp.Logger) *beat.Event {
