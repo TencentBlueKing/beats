@@ -25,9 +25,12 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"strings"
 
 	"github.com/elastic/beats/libbeat/logp"
 )
+
+const base64Protocol = "base64://"
 
 // LoadCertificate will load a certificate from disk and return a tls.Certificate or error
 func LoadCertificate(config *CertificateConfig) (*tls.Certificate, error) {
@@ -74,9 +77,16 @@ func ReadPEMFile(path, passphrase string) ([]byte, error) {
 	pass := []byte(passphrase)
 	var blocks []*pem.Block
 
-	content, err := ioutil.ReadFile(path)
-	if err != nil {
-		return nil, err
+	var content []byte
+	var err error
+
+	if strings.HasPrefix(path, base64Protocol) {
+		content = []byte(path)
+	} else {
+		content, err = ioutil.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	for len(content) > 0 {
@@ -138,13 +148,20 @@ func LoadCertificateAuthorities(CAs []string) (*x509.CertPool, []error) {
 		return nil, nil
 	}
 
+	var err error
+
 	roots := x509.NewCertPool()
 	for _, path := range CAs {
-		pemData, err := ioutil.ReadFile(path)
-		if err != nil {
-			logp.Critical("Failed reading CA certificate: %v", err)
-			errors = append(errors, fmt.Errorf("%v reading %v", err, path))
-			continue
+		var pemData []byte
+		if strings.HasPrefix(path, base64Protocol) {
+			pemData = []byte(path)
+		} else {
+			pemData, err = ioutil.ReadFile(path)
+			if err != nil {
+				logp.Critical("Failed reading CA certificate: %v", err)
+				errors = append(errors, fmt.Errorf("%v reading %v", err, path))
+				continue
+			}
 		}
 
 		if ok := roots.AppendCertsFromPEM(pemData); !ok {
