@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -71,6 +72,11 @@ func LoadCertificate(config *CertificateConfig) (*tls.Certificate, error) {
 	return &cert, nil
 }
 
+func DecodeBase64(s string) ([]byte, error) {
+	s = s[len(base64Protocol):]
+	return base64.StdEncoding.DecodeString(s)
+}
+
 // ReadPEMFile reads a PEM format file on disk and decrypt it with the privided password and
 // return the raw content.
 func ReadPEMFile(path, passphrase string) ([]byte, error) {
@@ -81,7 +87,10 @@ func ReadPEMFile(path, passphrase string) ([]byte, error) {
 	var err error
 
 	if strings.HasPrefix(path, base64Protocol) {
-		content = []byte(path)
+		content, err = DecodeBase64(path)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		content, err = ioutil.ReadFile(path)
 		if err != nil {
@@ -154,7 +163,12 @@ func LoadCertificateAuthorities(CAs []string) (*x509.CertPool, []error) {
 	for _, path := range CAs {
 		var pemData []byte
 		if strings.HasPrefix(path, base64Protocol) {
-			pemData = []byte(path)
+			pemData, err = DecodeBase64(path)
+			if err != nil {
+				logp.Critical("Failed reading base64 CA certificate: %v", err)
+				errors = append(errors, fmt.Errorf("%v reading %v", err, path))
+				continue
+			}
 		} else {
 			pemData, err = ioutil.ReadFile(path)
 			if err != nil {
