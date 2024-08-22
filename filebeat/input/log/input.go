@@ -551,7 +551,7 @@ func (p *Input) harvestExistingFile(newState file.State, oldState file.State) {
 	if oldState.Finished {
 		if oldState.Fileinfo == nil && newState.Fileinfo.Size() < oldState.Offset {
 			logp.Err("Old file was truncated. Starting from the beginning: %s, offset: %d, new size: %d,"+
-				" old inode: %d, new inode: %d", newState.Source, oldState.Offset, newState.Fileinfo.Size(), oldState.FileStateOS.Inode, newState.FileStateOS.Inode)
+				" old StateOS: %d, new StateOS: %d", newState.Source, oldState.Offset, newState.Fileinfo.Size(), oldState.FileStateOS.String(), newState.FileStateOS.String())
 			err := p.startHarvester(newState, 0)
 			if err != nil {
 				logp.Err("Harvester could not be started on truncated file: %s, Err: %s", newState.Source, err)
@@ -561,7 +561,7 @@ func (p *Input) harvestExistingFile(newState file.State, oldState file.State) {
 			return
 		} else if oldState.Fileinfo != nil && newState.Fileinfo.Size() < oldState.Fileinfo.Size() {
 			logp.Err("Old file was truncated. Starting from the beginning: %s, offset: %d, old size: %d, new size: %d,"+
-				" old inode: %d, new inode: %d", newState.Source, oldState.Offset, oldState.Fileinfo.Size(), newState.Fileinfo.Size(), oldState.FileStateOS.Inode, newState.FileStateOS.Inode)
+				" old StateOS: %d, new StateOS: %d", newState.Source, oldState.Offset, oldState.Fileinfo.Size(), newState.Fileinfo.Size(), oldState.FileStateOS.String(), newState.FileStateOS.String())
 			err := p.startHarvester(newState, 0)
 			if err != nil {
 				logp.Err("Harvester could not be started on truncated file: %s, Err: %s", newState.Source, err)
