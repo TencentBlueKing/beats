@@ -179,13 +179,15 @@ func (r *LineReader) advance() error {
 	if r.maxBytes != 0 {
 		// 如果已找到最后一个换行符索引位置，且超出最大限制，则找到第一行单独处理
 		if idx != -1 && idx > r.maxBytes {
+			var sz int
+			var err error
 			firstIdx := r.inBuffer.IndexFrom(r.inOffset, r.nl)
 			if firstIdx-r.maxBytes > 0 {
-				r.decode(r.maxBytes, true)
+				sz, err = r.decode(r.maxBytes, true)
 			} else {
-				r.decode(firstIdx+len(r.nl), false)
+				sz, err = r.decode(firstIdx+len(r.nl), false)
 			}
-			err := r.inBuffer.Advance(min(firstIdx+len(r.nl), r.maxBytes))
+			err = r.inBuffer.Advance(sz)
 			r.inBuffer.Reset()
 			r.inOffset = 0
 			return err
@@ -223,13 +225,15 @@ func (r *LineReader) advance() error {
 		if r.maxBytes != 0 {
 			// 如果已找到最后一个换行符索引位置，且超出最大限制，则找到第一行单独处理
 			if idx != -1 && idx > r.maxBytes {
+				var sz int
+				var err error
 				firstIdx := r.inBuffer.IndexFrom(r.inOffset, r.nl)
 				if firstIdx-r.maxBytes > 0 {
-					r.decode(r.maxBytes, true)
+					sz, err = r.decode(r.maxBytes, true)
 				} else {
-					r.decode(firstIdx+len(r.nl), false)
+					sz, err = r.decode(firstIdx+len(r.nl), false)
 				}
-				err := r.inBuffer.Advance(min(firstIdx+len(r.nl), r.maxBytes))
+				err = r.inBuffer.Advance(sz)
 				r.inBuffer.Reset()
 				r.inOffset = 0
 				return err
