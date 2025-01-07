@@ -182,7 +182,7 @@ func (r *LineReader) advance() error {
 			var sz int
 			var err error
 			firstIdx := r.inBuffer.IndexFrom(r.inOffset, r.nl)
-			if firstIdx-r.maxBytes > 0 {
+			if firstIdx > r.maxBytes {
 				sz, err = r.decode(r.maxBytes, true)
 			} else {
 				sz, err = r.decode(firstIdx+len(r.nl), false)
@@ -228,7 +228,7 @@ func (r *LineReader) advance() error {
 				var sz int
 				var err error
 				firstIdx := r.inBuffer.IndexFrom(r.inOffset, r.nl)
-				if firstIdx-r.maxBytes > 0 {
+				if firstIdx > r.maxBytes {
 					sz, err = r.decode(r.maxBytes, true)
 				} else {
 					sz, err = r.decode(firstIdx+len(r.nl), false)
