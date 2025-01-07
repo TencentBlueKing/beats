@@ -291,7 +291,7 @@ func TestDockerJSON(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			r := &mockReader{messages: test.input}
-			json := New(r, test.stream, test.partial, test.forceCRI, test.criflags, false)
+			json := New(r, test.stream, test.partial, test.forceCRI, test.criflags, false, 200)
 			message, err := json.Next()
 
 			if test.expectedError {
@@ -454,7 +454,7 @@ this is not JSON too
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			r := &mockBatchReader{messages: test.input}
-			json := New(r, test.stream, test.partial, test.forceCRI, test.criflags, true)
+			json := New(r, test.stream, test.partial, test.forceCRI, test.criflags, true, 200)
 
 			for _, expectedMessage := range test.expectedMessages {
 				message, err := json.Next()

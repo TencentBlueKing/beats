@@ -53,6 +53,7 @@ type DockerJSONReader struct {
 	lineBufferBytes int
 
 	totalBytes int
+	maxBytes   int
 }
 
 type LogLine struct {
@@ -64,7 +65,7 @@ type LogLine struct {
 }
 
 // New creates a new reader renaming a field
-func New(r reader.Reader, stream string, partial bool, forceCRI bool, CRIFlags bool, batchMode bool) *DockerJSONReader {
+func New(r reader.Reader, stream string, partial bool, forceCRI bool, CRIFlags bool, batchMode bool, maxBytes int) *DockerJSONReader {
 	reader := DockerJSONReader{
 		stream:    stream,
 		partial:   partial,
@@ -72,6 +73,7 @@ func New(r reader.Reader, stream string, partial bool, forceCRI bool, CRIFlags b
 		forceCRI:  forceCRI,
 		criflags:  CRIFlags,
 		batchMode: batchMode,
+		maxBytes:  maxBytes,
 	}
 
 	if runtime.GOOS == "windows" {
@@ -293,6 +295,7 @@ func (p *DockerJSONReader) next() (reader.Message, error) {
 		// Handle multiline messages, join partial lines
 		for p.partial && logLine.Partial {
 			next, err := p.reader.Next()
+			rawContent := next.Content
 
 			// keep the right bytes count even if we return an error
 			nbytes += next.Bytes
@@ -306,6 +309,21 @@ func (p *DockerJSONReader) next() (reader.Message, error) {
 				return message, err
 			}
 			message.Content = append(message.Content, next.Content...)
+			// 当行buffer与当前msg内容相加超过最大字节数，将buffer中的内容截断返回
+			if len(message.Content)+len(next.Content) > p.maxBytes {
+				// 计算截断位置
+				logStart := bytes.Index(rawContent, []byte(`"log":"`))
+				if logStart == -1 {
+					continue
+				}
+				logStart += len(`"log":"`)
+				truncateIdx := p.maxBytes - len(message.Content)
+
+				// 未截断部分写入texts，清空缓冲区
+				message.Content = append(message.Content, next.Content[:truncateIdx]...)
+				message.Bytes -= next.Bytes - logStart - truncateIdx
+				return message, nil
+			}
 		}
 
 		if p.stream != "all" && p.stream != logLine.Stream {
@@ -347,7 +365,9 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 
 			var logLine LogLine
 
-			content, err := p.batchParseLine(buffer[offset:offset+idx], &logLine)
+			// json解析前原始日志
+			rawContent := buffer[offset : offset+idx]
+			content, err := p.batchParseLine(rawContent, &logLine)
 
 			// 指针往前推移
 			offset += idx
@@ -361,6 +381,32 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 				// 本行日志还没结束，继续读取
 				if p.lineBuffer == nil {
 					p.lineBuffer = make([]byte, 0, len(content)*4)
+				}
+
+				// 当行buffer与当前msg内容相加超过最大字节数，将buffer中的内容截断返回
+				if len(p.lineBuffer)+len(content) > p.maxBytes {
+					// 计算截断位置
+					logStart := bytes.Index(rawContent, []byte(`"log":"`))
+					if logStart == -1 {
+						continue
+					}
+					logStart += len(`"log":"`)
+					truncateIdx := p.maxBytes - len(p.lineBuffer)
+
+					// 未截断部分写入texts，清空缓冲区
+					texts = append(texts, append(p.lineBuffer, content[:truncateIdx]...))
+					p.lineBuffer = nil
+					p.lineBufferBytes = 0
+
+					// 截断部分写入缓冲区
+					p.lineBuffer = append(p.lineBuffer, content[truncateIdx:]...)
+					p.lineBufferBytes += idx - logStart - truncateIdx
+
+					// 发送，消息大小追加上一次没有消耗完的部分
+					message.Content = bytes.Join(texts, nil)
+					message.Bytes -= p.lineBufferBytes
+					p.totalBytes -= message.Bytes
+					return message, nil
 				}
 				p.lineBuffer = append(p.lineBuffer, content...)
 				p.lineBufferBytes += idx

@@ -683,6 +683,7 @@ func (h *FileHarvester) newLogFileReader() (reader.Reader, error) {
 			h.config.DockerJSON.ForceCRI,
 			h.config.DockerJSON.CRIFlags,
 			h.config.IsLudicrousModeActivated(),
+			h.config.MaxBytes,
 		)
 	}
 
