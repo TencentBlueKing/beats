@@ -286,12 +286,47 @@ func TestDockerJSON(t *testing.T) {
 			},
 			partial: true,
 		},
+		{
+			name: "Split lines with max limit",
+			input: [][]byte{
+				[]byte(`{"log":"1:M 09 Nov 13:27:36.276 # User requested test xxxxxxxxxxxxxx","stream":"stdout","time":"2017-11-09T13:27:36.277747246Z"}`),
+				[]byte(`{"log":"User requested xxxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxx","stream":"stdout","time":"2017-11-09T13:27:36.277747246Z"}`),
+				[]byte(`{"log":"User requested xxxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxx","stream":"stdout","time":"2017-11-09T13:27:36.277747246Z"}`),
+				[]byte(`{"log":"User requested xxxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxx","stream":"stdout","time":"2017-11-09T13:27:36.277747246Z"}`),
+				[]byte(`{"log":"shutdown...\n","stream":"stdout","time":"2017-11-09T13:27:36.277747246Z"}`),
+			},
+			stream:  "stdout",
+			partial: true,
+			expectedMessage: reader.Message{
+				Content: []byte("1:M 09 Nov 13:27:36.276 # User requested test xxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxxUser reque"),
+				Fields:  common.MapStr{"stream": "stdout"},
+				Ts:      time.Date(2017, 11, 9, 13, 27, 36, 277747246, time.UTC),
+				Bytes:   432,
+			},
+		},
+		{
+			name: "CRI Split lines with max limit",
+			input: [][]byte{
+				[]byte(`2017-10-12T13:32:21.232861448Z stdout P 2017-10-12 13:32:21.212 [INFO][88] table.go 710: Invalidating dataplane cache`),
+				[]byte(`2017-11-12T23:32:21.212771448Z stdout P 2017-10-12 13:32:21.212 [INFO][88] table.go 710: Invalidating dataplane cache`),
+				[]byte(`2017-11-12T23:32:21.212771448Z stdout F 2017-10-12 13:32:21.212 [INFO][88] table.go 710: Invalidating dataplane cache`),
+			},
+			stream:  "stdout",
+			partial: true,
+			expectedMessage: reader.Message{
+				Content: []byte("2017-10-12 13:32:21.212 [INFO][88] table.go 710: Invalidating dataplane cache2017-10-12 13:32:21.212 [INFO][88] table.go 710: Invalidating dataplane cache2017-10-12 13:32:21.212 [INFO][88] table.go 710: Invalidating data"),
+				Fields:  common.MapStr{"stream": "stdout"},
+				Ts:      time.Date(2017, 10, 12, 13, 32, 21, 232861448, time.UTC),
+				Bytes:   340,
+			},
+			criflags: true,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			r := &mockReader{messages: test.input}
-			json := New(r, test.stream, test.partial, test.forceCRI, test.criflags, false, 200)
+			json := New(r, test.stream, test.partial, test.forceCRI, test.criflags, false, 220)
 			message, err := json.Next()
 
 			if test.expectedError {
@@ -448,6 +483,31 @@ this is not JSON too
 				},
 			},
 			criflags: true,
+		},
+		{
+			name: "Split lines with max limit",
+			input: [][]byte{
+				[]byte(`{"log":"1:M 09 Nov 13:27:36.276 # User requested shutdown...","stream":"stdout","time":"2017-11-09T13:27:36.277747246Z"}
+{"log":"1:M 09 Nov 13:28:36.276 # User requested shutdown...","stream":"stdout","time":"2017-11-09T13:28:36.277747246Z"}
+{"log":"1:M 09 Nov 13:28:54.276 # User requested shutdown...","stream":"stdout","time":"2017-11-09T13:28:54.277747246Z"}`),
+				[]byte(`{"log":"1:M 09 Nov 14:27:36.276 # User requested shutdown... success","stream":"stdout","time":"2017-11-09T14:27:36.277747246Z"}
+{"log":"1:M 09 Nov 14:28:36.276 # User requested shutdown... failed","stream":"stdout","time":"2017-11-09T14:28:36.277747246Z"}
+{"log":"1:M 09 Nov 14:28:54.276 # User requested shutdown... skipped\n","stream":"stdout","time":"2017-11-09T14:28:54.277747246Z"}`),
+			},
+			partial: true,
+			stream:  "all",
+			expectedMessages: []reader.Message{
+				{
+					Content: []byte("1:M 09 Nov 13:27:36.276 # User requested shutdown...1:M 09 Nov 13:28:36.276 # User requested shutdown...1:M 09 Nov 13:28:54.276 # User requested shutdown...1:M 09 Nov 14:27:36.276 # User requested shu"),
+					//Fields:  common.MapStr{"stream": "stdout"},
+					Bytes: 414,
+				},
+				{
+					Content: []byte("tdown... success1:M 09 Nov 14:28:36.276 # User requested shutdown... failed1:M 09 Nov 14:28:54.276 # User requested shutdown... skipped\n"),
+					//Fields:  common.MapStr{"stream": "stdout"},
+					Bytes: 335,
+				},
+			},
 		},
 	}
 
