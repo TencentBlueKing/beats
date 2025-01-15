@@ -301,7 +301,7 @@ func TestDockerJSON(t *testing.T) {
 				Content: []byte("1:M 09 Nov 13:27:36.276 # User requested test xxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxxUser requested xxxxxxxxxxxxxxxUser reque"),
 				Fields:  common.MapStr{"stream": "stdout"},
 				Ts:      time.Date(2017, 11, 9, 13, 27, 36, 277747246, time.UTC),
-				Bytes:   432,
+				Bytes:   593,
 			},
 		},
 		{
@@ -317,7 +317,7 @@ func TestDockerJSON(t *testing.T) {
 				Content: []byte("2017-10-12 13:32:21.212 [INFO][88] table.go 710: Invalidating dataplane cache2017-10-12 13:32:21.212 [INFO][88] table.go 710: Invalidating dataplane cache2017-10-12 13:32:21.212 [INFO][88] table.go 710: Invalidating data"),
 				Fields:  common.MapStr{"stream": "stdout"},
 				Ts:      time.Date(2017, 10, 12, 13, 32, 21, 232861448, time.UTC),
-				Bytes:   340,
+				Bytes:   351,
 			},
 			criflags: true,
 		},
@@ -500,12 +500,7 @@ this is not JSON too
 				{
 					Content: []byte("1:M 09 Nov 13:27:36.276 # User requested shutdown...1:M 09 Nov 13:28:36.276 # User requested shutdown...1:M 09 Nov 13:28:54.276 # User requested shutdown...1:M 09 Nov 14:27:36.276 # User requested shu"),
 					//Fields:  common.MapStr{"stream": "stdout"},
-					Bytes: 414,
-				},
-				{
-					Content: []byte("tdown... success1:M 09 Nov 14:28:36.276 # User requested shutdown... failed1:M 09 Nov 14:28:54.276 # User requested shutdown... skipped\n"),
-					//Fields:  common.MapStr{"stream": "stdout"},
-					Bytes: 335,
+					Bytes: 749,
 				},
 			},
 		},

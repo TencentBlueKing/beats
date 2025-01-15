@@ -23,7 +23,6 @@ package readfile
 import (
 	"bytes"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
@@ -263,7 +262,7 @@ func setupTestMaxBytesLimit(lineMaxLimit, lineLen int, nl []byte) (lines []strin
 		if randomBool(rnd) {
 			// Boundary to the lineMaxLimit
 			if randomBool(rnd) {
-				sz = randomInt(rnd, lineMaxLimit-1, lineMaxLimit+1)
+				sz = randomInt(rnd, lineMaxLimit-1, lineMaxLimit*4)
 			} else {
 				sz = randomInt(rnd, 0, lineLen)
 			}
@@ -317,15 +316,7 @@ func TestMaxBytesLimit(t *testing.T) {
 	}
 
 	// Read decodec lines and test
-	newLines := make([][]byte, 0, len(lines))
-	for _, line := range lines {
-		for len(line) > lineMaxLimit {
-			newLines = append(newLines, []byte(line[:lineMaxLimit]))
-			line = line[lineMaxLimit:]
-		}
-		newLines = append(newLines, []byte(line))
-	}
-
+	var idx int
 	for i := 0; ; i++ {
 		b, n, err := reader.Next()
 		if err != nil {
@@ -336,21 +327,36 @@ func TestMaxBytesLimit(t *testing.T) {
 			}
 		}
 
-		newLine := newLines[i]
-		var gotLen int
-		var s []byte
-		if bytes.LastIndex(b, nl) != -1 {
-			gotLen = n - len(nl)
-			s = b[:len(b)-len(nl)]
-		} else {
-			gotLen = n
-			s = b
+		// Find the next expected line from the original test array
+		var line string
+		var originLine string
+		var linesLen int
+		firstIdx := bytes.Index(b, nl)
+		for firstIdx != -1 {
+			for ; idx < len(lines); idx++ {
+
+				originLine = lines[idx]
+				// Expected to be dropped
+				if len(lines[idx]) > lineMaxLimit {
+					originLine = lines[idx]
+					lines[idx] = lines[idx][:lineMaxLimit]
+				}
+				line = lines[idx]
+				idx++
+				break
+			}
+			firstBytes := b[:firstIdx]
+			s := string(firstBytes)
+			if line != s {
+				t.Fatalf("lines do not match, expected: %s got: %s", line, s)
+			}
+			linesLen += len(originLine) + len(nl)
+			b = b[firstIdx+len(nl):]
+			firstIdx = bytes.Index(b, nl)
 		}
-		if len(newLine) != gotLen {
-			fmt.Printf("invalid line length, expected: %d got: %d", len(newLine), gotLen)
+		if linesLen != n {
+			t.Fatalf("invalid line length, expected: %d got: %d", len(line), n)
 		}
-		if !bytes.Equal(newLine, s) {
-			t.Fatalf("lines do not match, expected: %s got: %s", newLine, s)
-		}
+
 	}
 }

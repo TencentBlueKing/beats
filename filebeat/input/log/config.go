@@ -59,7 +59,7 @@ var (
 		ReuseMaxBytes:  100 * humanize.MiByte,
 
 		BufferSize: 16 * humanize.KiByte,
-		MaxBytes:   1 * humanize.MiByte,
+		MaxBytes:   10 * humanize.MiByte,
 		LogConfig: LogConfig{
 			Backoff:       1 * time.Second,
 			BackoffFactor: 2,

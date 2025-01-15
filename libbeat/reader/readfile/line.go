@@ -176,24 +176,6 @@ func (r *LineReader) advance() error {
 	// Initial check if buffer has already a newLine character
 	idx := r.findInBufferIndex(r.inOffset, r.nl)
 
-	if r.maxBytes != 0 {
-		// 如果已找到最后一个换行符索引位置，且超出最大限制，则找到第一行单独处理
-		if idx != -1 && idx > r.maxBytes {
-			var sz int
-			var err error
-			firstIdx := r.inBuffer.IndexFrom(r.inOffset, r.nl)
-			if firstIdx > r.maxBytes {
-				sz, err = r.decode(r.maxBytes, true)
-			} else {
-				sz, err = r.decode(firstIdx+len(r.nl), false)
-			}
-			err = r.inBuffer.Advance(sz)
-			r.inBuffer.Reset()
-			r.inOffset = 0
-			return err
-		}
-	}
-
 	// fill inBuffer until '\n' sequence has been found in input buffer
 	for idx == -1 {
 		// increase search offset to reduce iterations on buffer when looping
@@ -225,31 +207,34 @@ func (r *LineReader) advance() error {
 		if r.maxBytes != 0 {
 			// 如果已找到最后一个换行符索引位置，且超出最大限制，则找到第一行单独处理
 			if idx != -1 && idx > r.maxBytes {
-				var sz int
 				var err error
 				firstIdx := r.inBuffer.IndexFrom(r.inOffset, r.nl)
 				if firstIdx > r.maxBytes {
-					sz, err = r.decode(r.maxBytes, true)
+					_, err = r.decode(r.maxBytes, true)
+					r.skippedByteCount += firstIdx + len(r.nl) - r.maxBytes
 				} else {
-					sz, err = r.decode(firstIdx+len(r.nl), false)
+					_, err = r.decode(firstIdx+len(r.nl), false)
 				}
-				err = r.inBuffer.Advance(sz)
+				err = r.inBuffer.Advance(firstIdx + len(r.nl))
 				r.inBuffer.Reset()
 				r.inOffset = 0
 				return err
 			}
-			// 如果未找到最后一个换行符索引位置，且超出最大限制，则分批上报，先处理最大限制字节数
+			// 如果未找到最后一个换行符索引位置，且超出最大限制，则分截断上报，仅处理最大限制字节数
 			if idx == -1 && r.inBuffer.Len() > r.maxBytes {
-				idx = r.maxBytes
-				sz, err := r.decode(idx, true)
+				sz, err := r.decode(r.maxBytes, true)
 				if err != nil {
 					logp.Err("Error decoding line: %s", err)
 					// In case of error increase size by unencoded length
-					sz = idx
+					sz = r.maxBytes
 				}
 				err = r.inBuffer.Advance(sz)
 				r.inBuffer.Reset()
 				r.inOffset = 0
+
+				// 跳过该行剩余字节
+				skipped, err := r.skipUntilNewLine(buf)
+				r.skippedByteCount += skipped
 				return err
 			}
 		}

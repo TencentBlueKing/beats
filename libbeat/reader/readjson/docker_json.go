@@ -90,7 +90,7 @@ func New(r reader.Reader, stream string, partial bool, forceCRI bool, CRIFlags b
 // parseCRILog parses logs in CRI log format.
 // CRI log format example :
 // 2017-09-12T22:32:21.212861448Z stdout 2017-09-12 22:32:21.212 [INFO][88] table.go 710: Invalidating dataplane cache
-func (p *DockerJSONReader) parseCRILog(message *reader.Message, msg *LogLine) (int, error) {
+func (p *DockerJSONReader) parseCRILog(message *reader.Message, msg *LogLine) error {
 	split := 3
 	// read line tags if split is enabled:
 	if p.criflags {
@@ -103,11 +103,11 @@ func (p *DockerJSONReader) parseCRILog(message *reader.Message, msg *LogLine) (i
 	// timestamp
 	log := bytes.SplitN(message.Content, []byte{' '}, split)
 	if len(log) < split {
-		return 0, errors.New("invalid CRI log format")
+		return errors.New("invalid CRI log format")
 	}
 	ts, err := time.Parse(time.RFC3339, string(log[i]))
 	if err != nil {
-		return 0, errors.Wrap(err, "parsing CRI timestamp")
+		return errors.Wrap(err, "parsing CRI timestamp")
 	}
 	message.Ts = ts
 	i++
@@ -133,44 +133,42 @@ func (p *DockerJSONReader) parseCRILog(message *reader.Message, msg *LogLine) (i
 	message.AddFields(common.MapStr{
 		"stream": msg.Stream,
 	})
-	contentIdx := bytes.Index(message.Content, log[i])
 	// Remove \n ending for partial messages
 	message.Content = log[i]
 	if partial {
 		message.Content = p.stripNewLine(message.Content)
 	}
 
-	return contentIdx, nil
+	return nil
 }
 
 // parseReaderLog parses logs in Docker JSON log format.
 // Docker JSON log format example:
 // {"log":"1:M 09 Nov 13:27:36.276 # User requested shutdown...\n","stream":"stdout"}
-func (p *DockerJSONReader) parseDockerJSONLog(message *reader.Message, msg *LogLine) (int, error) {
+func (p *DockerJSONReader) parseDockerJSONLog(message *reader.Message, msg *LogLine) error {
 	err := easyjson.Unmarshal(message.Content, msg)
 
 	if err != nil {
-		return 0, errors.Wrap(err, "decoding docker JSON")
+		return errors.Wrap(err, "decoding docker JSON")
 	}
 
 	// Parse timestamp
 	ts, err := time.Parse(time.RFC3339, msg.Time)
 	if err != nil {
-		return 0, errors.Wrap(err, "parsing docker timestamp")
+		return errors.Wrap(err, "parsing docker timestamp")
 	}
 
 	message.AddFields(common.MapStr{
 		"stream": msg.Stream,
 	})
-	contentIdx := bytes.Index(message.Content, []byte(msg.Log))
 	message.Content = []byte(msg.Log)
 	message.Ts = ts
 	msg.Partial = message.Content[len(message.Content)-1] != byte('\n')
 
-	return contentIdx, nil
+	return nil
 }
 
-func (p *DockerJSONReader) parseLine(message *reader.Message, msg *LogLine) (int, error) {
+func (p *DockerJSONReader) parseLine(message *reader.Message, msg *LogLine) error {
 	if p.forceCRI {
 		return p.parseCRILog(message, msg)
 	}
@@ -186,7 +184,7 @@ func (p *DockerJSONReader) parseLine(message *reader.Message, msg *LogLine) (int
 // parseCRILog parses logs in CRI log format.
 // CRI log format example :
 // 2017-09-12T22:32:21.212861448Z stdout 2017-09-12 22:32:21.212 [INFO][88] table.go 710: Invalidating dataplane cache
-func (p *DockerJSONReader) batchParseCRILog(content []byte, msg *LogLine) ([]byte, int, error) {
+func (p *DockerJSONReader) batchParseCRILog(content []byte, msg *LogLine) ([]byte, error) {
 	split := 3
 	// read line tags if split is enabled:
 	if p.criflags {
@@ -198,11 +196,11 @@ func (p *DockerJSONReader) batchParseCRILog(content []byte, msg *LogLine) ([]byt
 
 	log := bytes.SplitN(content, []byte{' '}, split)
 	if len(log) < split {
-		return nil, 0, errors.New("invalid CRI log format")
+		return nil, errors.New("invalid CRI log format")
 	}
 	_, err := time.Parse(time.RFC3339, string(log[i]))
 	if err != nil {
-		return nil, 0, errors.Wrap(err, "parsing CRI timestamp")
+		return nil, errors.Wrap(err, "parsing CRI timestamp")
 	}
 	i++
 
@@ -225,40 +223,38 @@ func (p *DockerJSONReader) batchParseCRILog(content []byte, msg *LogLine) ([]byt
 
 	msg.Partial = partial
 
-	contentIdx := bytes.Index(content, log[i])
 	// Remove \n ending for partial messages
 	content = log[i]
 	if partial {
 		content = p.stripNewLine(content)
 	}
 
-	return content, contentIdx, nil
+	return content, nil
 }
 
 // parseReaderLog parses logs in Docker JSON log format.
 // Docker JSON log format example:
 // {"log":"1:M 09 Nov 13:27:36.276 # User requested shutdown...\n","stream":"stdout"}
-func (p *DockerJSONReader) batchParseDockerJSONLog(content []byte, msg *LogLine) ([]byte, int, error) {
+func (p *DockerJSONReader) batchParseDockerJSONLog(content []byte, msg *LogLine) ([]byte, error) {
 	err := easyjson.Unmarshal(content, msg)
 
 	if err != nil {
-		return nil, 0, errors.Wrap(err, "decoding docker JSON")
+		return nil, errors.Wrap(err, "decoding docker JSON")
 	}
 
 	// Parse timestamp
 	_, err = time.Parse(time.RFC3339, msg.Time)
 	if err != nil {
-		return nil, 0, errors.Wrap(err, "parsing docker timestamp")
+		return nil, errors.Wrap(err, "parsing docker timestamp")
 	}
 
-	contentIdx := bytes.Index(content, []byte(msg.Log))
 	content = []byte(msg.Log)
 	msg.Partial = content[len(content)-1] != byte('\n')
 
-	return content, contentIdx, nil
+	return content, nil
 }
 
-func (p *DockerJSONReader) batchParseLine(content []byte, msg *LogLine) ([]byte, int, error) {
+func (p *DockerJSONReader) batchParseLine(content []byte, msg *LogLine) ([]byte, error) {
 	if p.forceCRI {
 		return p.batchParseCRILog(content, msg)
 	}
@@ -281,6 +277,7 @@ func (p *DockerJSONReader) Next() (reader.Message, error) {
 
 func (p *DockerJSONReader) next() (reader.Message, error) {
 	var nbytes int
+	p.lineFinished = false
 	for {
 		message, err := p.reader.Next()
 
@@ -293,7 +290,7 @@ func (p *DockerJSONReader) next() (reader.Message, error) {
 		}
 
 		var logLine LogLine
-		contentIdx, err := p.parseLine(&message, &logLine)
+		err = p.parseLine(&message, &logLine)
 		if err != nil {
 			return message, err
 		}
@@ -309,7 +306,7 @@ func (p *DockerJSONReader) next() (reader.Message, error) {
 			if err != nil {
 				return message, err
 			}
-			contentIdx, err = p.parseLine(&next, &logLine)
+			err = p.parseLine(&next, &logLine)
 			if err != nil {
 				return message, err
 			}
@@ -319,10 +316,11 @@ func (p *DockerJSONReader) next() (reader.Message, error) {
 				truncateIdx := p.maxBytes - len(message.Content)
 				// 未截断部分写入texts，清空缓冲区
 				message.Content = append(message.Content, next.Content[:truncateIdx]...)
-				message.Bytes -= next.Bytes - contentIdx - truncateIdx
-				return message, nil
+				p.lineFinished = true
 			}
-			message.Content = append(message.Content, next.Content...)
+			if !p.lineFinished {
+				message.Content = append(message.Content, next.Content...)
+			}
 		}
 
 		if p.stream != "all" && p.stream != logLine.Stream {
@@ -336,16 +334,6 @@ func (p *DockerJSONReader) next() (reader.Message, error) {
 func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 
 	for {
-		// 缓冲区内数据已存在行结束符，优先上报
-		if p.lineFinished && len(p.lineBuffer) > 0 {
-			var message reader.Message
-			// 清空缓冲区
-			message.Content = p.lineBuffer
-			message.Bytes = p.lineBufferBytes
-			p.totalBytes -= message.Bytes
-			p.lineFinished = false
-			return message, nil
-		}
 
 		message, err := p.reader.Next()
 
@@ -362,7 +350,6 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 
 		// 当前位置
 		var offset int
-		skipped := false
 		for offset < len(buffer) {
 			// 继续解析下一行日志
 			idx := bytes.Index(buffer[offset:], []byte{'\n'})
@@ -377,7 +364,7 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 
 			// json解析前原始日志
 			rawContent := buffer[offset : offset+idx]
-			content, contentIdx, err := p.batchParseLine(rawContent, &logLine)
+			content, err := p.batchParseLine(rawContent, &logLine)
 
 			// 指针往前推移
 			offset += idx
@@ -399,16 +386,12 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 
 					// 未截断部分写入texts，清空缓冲区
 					texts = append(texts, append(p.lineBuffer, content[:truncateIdx]...))
-					message.Bytes = p.lineBufferBytes + contentIdx + truncateIdx
-					p.totalBytes -= message.Bytes
+
+					// 清空缓冲区，此行标记为返回结束
 					p.lineBuffer = nil
 					p.lineBufferBytes = 0
-
-					// 截断部分写入缓冲区
-					p.lineBuffer = append(p.lineBuffer, content[truncateIdx:]...)
-					p.lineBufferBytes += idx - contentIdx - truncateIdx
-					skipped = true
-				} else {
+					p.lineFinished = true
+				} else if !p.lineFinished {
 					p.lineBuffer = append(p.lineBuffer, content...)
 					p.lineBufferBytes += idx
 				}
@@ -416,20 +399,25 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 			}
 
 			if p.stream == "all" || p.stream == logLine.Stream {
-				if skipped {
-					p.lineBuffer = append(p.lineBuffer, content...)
-					p.lineBufferBytes += idx
-				} else {
-					texts = append(texts, append(p.lineBuffer, content...))
+				if !p.lineFinished {
+					if len(p.lineBuffer)+len(content) > p.maxBytes {
+						// 计算截断位置
+						truncateIdx := p.maxBytes - len(p.lineBuffer)
+
+						// 未截断部分写入texts，清空缓冲区
+						texts = append(texts, append(p.lineBuffer, content[:truncateIdx]...))
+
+						// 清空缓冲区，此行标记为读取结束
+						p.lineFinished = true
+					} else {
+						texts = append(texts, append(p.lineBuffer, content...))
+					}
 				}
-				p.lineFinished = true
 			}
 
-			// 行日志已经结束，直接清空缓存;如果存在截断分批，不清空截断后缓存
-			if !skipped {
-				p.lineBuffer = nil
-				p.lineBufferBytes = 0
-			}
+			// 行日志已经结束，直接清空缓存
+			p.lineBuffer = nil
+			p.lineBufferBytes = 0
 		}
 
 		if len(texts) > 0 {
@@ -437,10 +425,9 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 			message.Content = bytes.Join(texts, nil)
 
 			// 消息大小追加上一次没有消耗完的部分
-			if !skipped {
-				message.Bytes -= p.lineBufferBytes
-				p.totalBytes -= message.Bytes
-			}
+			message.Bytes -= p.lineBufferBytes
+			p.totalBytes -= message.Bytes
+			p.lineFinished = false
 			return message, nil
 		}
 
