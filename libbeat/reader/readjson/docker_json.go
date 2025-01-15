@@ -416,6 +416,7 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 			}
 
 			// 行日志已经结束，直接清空缓存
+			p.lineFinished = false
 			p.lineBuffer = nil
 			p.lineBufferBytes = 0
 		}
@@ -427,7 +428,6 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 			// 消息大小追加上一次没有消耗完的部分
 			message.Bytes -= p.lineBufferBytes
 			p.totalBytes -= message.Bytes
-			p.lineFinished = false
 			return message, nil
 		}
 
