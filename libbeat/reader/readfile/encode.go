@@ -52,6 +52,7 @@ func NewEncodeReader(r io.Reader, config Config) (EncoderReader, error) {
 // This converts a io.Reader to a reader.reader
 func (r EncoderReader) Next() (reader.Message, error) {
 	c, sz, err := r.reader.Next()
+	reader.LineBytesTotal.Add(int64(sz))
 	// Creating message object
 	return reader.Message{
 		Ts:      time.Now(),
