@@ -19,6 +19,7 @@ package readfile
 
 import (
 	"bytes"
+	"github.com/elastic/beats/libbeat/reader"
 	"io"
 
 	"golang.org/x/text/encoding"
@@ -218,6 +219,7 @@ func (r *LineReader) advance() error {
 				err = r.inBuffer.Advance(firstIdx + len(r.nl))
 				r.inBuffer.Reset()
 				r.inOffset = 0
+				reader.LineMaxBytes.Add(1)
 				return err
 			}
 			// 如果未找到最后一个换行符索引位置，且超出最大限制，则分截断上报，仅处理最大限制字节数
@@ -235,6 +237,7 @@ func (r *LineReader) advance() error {
 				// 跳过该行剩余字节
 				skipped, err := r.skipUntilNewLine(buf)
 				r.skippedByteCount += skipped
+				reader.LineMaxBytes.Add(1)
 				return err
 			}
 		}

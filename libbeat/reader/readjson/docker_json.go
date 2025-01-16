@@ -317,6 +317,7 @@ func (p *DockerJSONReader) next() (reader.Message, error) {
 				// 未截断部分写入texts，清空缓冲区
 				message.Content = append(message.Content, next.Content[:truncateIdx]...)
 				p.lineFinished = true
+				reader.LineMaxBytes.Add(1)
 			}
 			if !p.lineFinished {
 				message.Content = append(message.Content, next.Content...)
@@ -391,6 +392,7 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 					p.lineBuffer = nil
 					p.lineBufferBytes = 0
 					p.lineFinished = true
+					reader.LineMaxBytes.Add(1)
 				} else if !p.lineFinished {
 					p.lineBuffer = append(p.lineBuffer, content...)
 					p.lineBufferBytes += idx
@@ -409,6 +411,7 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 
 						// 清空缓冲区，此行标记为读取结束
 						p.lineFinished = true
+						reader.LineMaxBytes.Add(1)
 					} else {
 						texts = append(texts, append(p.lineBuffer, content...))
 					}
