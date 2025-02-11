@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//go:build !integration
 // +build !integration
 
 package readfile
@@ -98,7 +99,7 @@ func TestReaderEncodings(t *testing.T) {
 		}
 
 		// create line reader
-		reader, err := NewLineReader(ioutil.NopCloser(buffer), Config{codec, 1024, unlimited})
+		reader, err := NewLineReader(ioutil.NopCloser(buffer), Config{codec, 1024, unlimited, true})
 		if err != nil {
 			t.Errorf("failed to initialize reader: %v", err)
 			continue
@@ -189,7 +190,7 @@ func testReadLines(t *testing.T, inputLines [][]byte) {
 	// initialize reader
 	buffer := bytes.NewBuffer(inputStream)
 	codec, _ := encoding.Plain(buffer)
-	reader, err := NewLineReader(buffer, Config{codec, buffer.Len(), unlimited})
+	reader, err := NewLineReader(buffer, Config{codec, buffer.Len(), unlimited, true})
 	if err != nil {
 		t.Fatalf("Error initializing reader: %v", err)
 	}
@@ -261,7 +262,7 @@ func setupTestMaxBytesLimit(lineMaxLimit, lineLen int, nl []byte) (lines []strin
 		if randomBool(rnd) {
 			// Boundary to the lineMaxLimit
 			if randomBool(rnd) {
-				sz = randomInt(rnd, lineMaxLimit-1, lineMaxLimit+1)
+				sz = randomInt(rnd, lineMaxLimit-1, lineMaxLimit*4)
 			} else {
 				sz = randomInt(rnd, 0, lineLen)
 			}
@@ -287,10 +288,10 @@ func setupTestMaxBytesLimit(lineMaxLimit, lineLen int, nl []byte) (lines []strin
 func TestMaxBytesLimit(t *testing.T) {
 	const (
 		enc           = "plain"
-		numberOfLines = 102
-		bufferSize    = 1024
-		lineMaxLimit  = 3012
-		lineLen       = 5720 // exceeds lineMaxLimit
+		numberOfLines = 20
+		bufferSize    = 100
+		lineMaxLimit  = 200
+		lineLen       = 200 // exceeds lineMaxLimit
 	)
 
 	codecFactory, ok := encoding.FindEncoding(enc)
@@ -309,7 +310,7 @@ func TestMaxBytesLimit(t *testing.T) {
 	}
 
 	// Create line reader
-	reader, err := NewLineReader(ioutil.NopCloser(strings.NewReader(input)), Config{codec, bufferSize, lineMaxLimit})
+	reader, err := NewLineReader(ioutil.NopCloser(strings.NewReader(input)), Config{codec, bufferSize, lineMaxLimit, true})
 	if err != nil {
 		t.Fatal("failed to initialize reader:", err)
 	}
@@ -328,24 +329,34 @@ func TestMaxBytesLimit(t *testing.T) {
 
 		// Find the next expected line from the original test array
 		var line string
-		for ; idx < len(lines); idx++ {
-			// Expected to be dropped
-			if len(lines[idx]) > lineMaxLimit {
-				continue
+		var originLine string
+		var linesLen int
+		firstIdx := bytes.Index(b, nl)
+		for firstIdx != -1 {
+			for ; idx < len(lines); idx++ {
+
+				originLine = lines[idx]
+				// Expected to be dropped
+				if len(lines[idx]) > lineMaxLimit {
+					originLine = lines[idx]
+					lines[idx] = lines[idx][:lineMaxLimit]
+				}
+				line = lines[idx]
+				idx++
+				break
 			}
-			line = lines[idx]
-			idx++
-			break
+			firstBytes := b[:firstIdx]
+			s := string(firstBytes)
+			if line != s {
+				t.Fatalf("lines do not match, expected: %s got: %s", line, s)
+			}
+			linesLen += len(originLine) + len(nl)
+			b = b[firstIdx+len(nl):]
+			firstIdx = bytes.Index(b, nl)
+		}
+		if linesLen != n {
+			t.Fatalf("invalid line length, expected: %d got: %d", len(line), n)
 		}
 
-		gotLen := n - len(nl)
-		s := string(b[:len(b)-len(nl)])
-		if len(line) != gotLen {
-			t.Fatalf("invalid line length, expected: %d got: %d", len(line), gotLen)
-		}
-
-		if line != s {
-			t.Fatalf("lines do not match, expected: %s got: %s", line, s)
-		}
 	}
 }

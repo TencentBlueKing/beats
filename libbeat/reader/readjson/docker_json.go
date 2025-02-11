@@ -52,7 +52,9 @@ type DockerJSONReader struct {
 	lineBuffer      []byte
 	lineBufferBytes int
 
-	totalBytes int
+	totalBytes   int
+	maxBytes     int
+	lineFinished bool
 }
 
 type LogLine struct {
@@ -64,14 +66,16 @@ type LogLine struct {
 }
 
 // New creates a new reader renaming a field
-func New(r reader.Reader, stream string, partial bool, forceCRI bool, CRIFlags bool, batchMode bool) *DockerJSONReader {
+func New(r reader.Reader, stream string, partial bool, forceCRI bool, CRIFlags bool, batchMode bool, maxBytes int) *DockerJSONReader {
 	reader := DockerJSONReader{
-		stream:    stream,
-		partial:   partial,
-		reader:    r,
-		forceCRI:  forceCRI,
-		criflags:  CRIFlags,
-		batchMode: batchMode,
+		stream:       stream,
+		partial:      partial,
+		reader:       r,
+		forceCRI:     forceCRI,
+		criflags:     CRIFlags,
+		batchMode:    batchMode,
+		maxBytes:     maxBytes,
+		lineFinished: false,
 	}
 
 	if runtime.GOOS == "windows" {
@@ -273,6 +277,7 @@ func (p *DockerJSONReader) Next() (reader.Message, error) {
 
 func (p *DockerJSONReader) next() (reader.Message, error) {
 	var nbytes int
+	p.lineFinished = false
 	for {
 		message, err := p.reader.Next()
 
@@ -305,7 +310,18 @@ func (p *DockerJSONReader) next() (reader.Message, error) {
 			if err != nil {
 				return message, err
 			}
-			message.Content = append(message.Content, next.Content...)
+			// 当行buffer与当前msg内容相加超过最大字节数，将buffer中的内容截断返回
+			if len(message.Content)+len(next.Content) > p.maxBytes {
+				// 计算截断位置
+				truncateIdx := p.maxBytes - len(message.Content)
+				// 未截断部分写入texts，清空缓冲区
+				message.Content = append(message.Content, next.Content[:truncateIdx]...)
+				p.lineFinished = true
+				reader.LinesTruncated.Add(1)
+			}
+			if !p.lineFinished {
+				message.Content = append(message.Content, next.Content...)
+			}
 		}
 
 		if p.stream != "all" && p.stream != logLine.Stream {
@@ -319,6 +335,7 @@ func (p *DockerJSONReader) next() (reader.Message, error) {
 func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 
 	for {
+
 		message, err := p.reader.Next()
 
 		message.Bytes += p.totalBytes
@@ -334,7 +351,6 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 
 		// 当前位置
 		var offset int
-
 		for offset < len(buffer) {
 			// 继续解析下一行日志
 			idx := bytes.Index(buffer[offset:], []byte{'\n'})
@@ -347,7 +363,9 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 
 			var logLine LogLine
 
-			content, err := p.batchParseLine(buffer[offset:offset+idx], &logLine)
+			// json解析前原始日志
+			rawContent := buffer[offset : offset+idx]
+			content, err := p.batchParseLine(rawContent, &logLine)
 
 			// 指针往前推移
 			offset += idx
@@ -362,16 +380,46 @@ func (p *DockerJSONReader) batchNext() (reader.Message, error) {
 				if p.lineBuffer == nil {
 					p.lineBuffer = make([]byte, 0, len(content)*4)
 				}
-				p.lineBuffer = append(p.lineBuffer, content...)
-				p.lineBufferBytes += idx
+				// 当行buffer与当前msg内容相加超过最大字节数，将buffer中的内容截断返回
+				if len(p.lineBuffer)+len(content) > p.maxBytes {
+					// 计算截断位置
+					truncateIdx := p.maxBytes - len(p.lineBuffer)
+
+					// 未截断部分写入texts，清空缓冲区
+					texts = append(texts, append(p.lineBuffer, content[:truncateIdx]...))
+
+					// 清空缓冲区，此行标记为返回结束
+					p.lineBuffer = nil
+					p.lineBufferBytes = 0
+					p.lineFinished = true
+					reader.LinesTruncated.Add(1)
+				} else if !p.lineFinished {
+					p.lineBuffer = append(p.lineBuffer, content...)
+					p.lineBufferBytes += idx
+				}
 				continue
 			}
 
 			if p.stream == "all" || p.stream == logLine.Stream {
-				texts = append(texts, append(p.lineBuffer, content...))
+				if !p.lineFinished {
+					if len(p.lineBuffer)+len(content) > p.maxBytes {
+						// 计算截断位置
+						truncateIdx := p.maxBytes - len(p.lineBuffer)
+
+						// 未截断部分写入texts，清空缓冲区
+						texts = append(texts, append(p.lineBuffer, content[:truncateIdx]...))
+
+						// 清空缓冲区，此行标记为读取结束
+						p.lineFinished = true
+						reader.LinesTruncated.Add(1)
+					} else {
+						texts = append(texts, append(p.lineBuffer, content...))
+					}
+				}
 			}
 
 			// 行日志已经结束，直接清空缓存
+			p.lineFinished = false
 			p.lineBuffer = nil
 			p.lineBufferBytes = 0
 		}

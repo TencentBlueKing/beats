@@ -671,7 +671,7 @@ func (h *FileHarvester) newLogFileReader() (reader.Reader, error) {
 	// for the worst case scenario where incoming UTF32 charchers are decoded to the single byte UTF-8 characters.
 	// This limit serves primarily to avoid memory bload or potential OOM with expectedly long lines in the file.
 	// The further size limiting is performed by LimitReader at the end of the readers pipeline as needed.
-	encReaderMaxBytes := h.config.MaxBytes * 4
+	encReaderMaxBytes := h.config.MaxBytes
 
 	r, err = readfile.NewEncodeReader(reader, readfile.Config{
 		Codec:      h.encoding,
@@ -692,6 +692,7 @@ func (h *FileHarvester) newLogFileReader() (reader.Reader, error) {
 			h.config.DockerJSON.ForceCRI,
 			h.config.DockerJSON.CRIFlags,
 			h.config.IsLudicrousModeActivated(),
+			h.config.MaxBytes,
 		)
 	}
 

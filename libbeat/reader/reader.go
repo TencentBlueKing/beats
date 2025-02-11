@@ -17,6 +17,11 @@
 
 package reader
 
+import "github.com/elastic/beats/libbeat/monitoring"
+
+var LinesTruncated = monitoring.NewInt(nil, "filebeat.input.log.lines.truncated")
+var LineBytesTotal = monitoring.NewInt(nil, "filebeat.input.log.line_bytes_total")
+
 // Reader is the interface that wraps the basic Next method for
 // getting a new message.
 // Next returns the message being read or and error. EOF is returned
