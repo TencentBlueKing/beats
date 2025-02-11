@@ -490,17 +490,39 @@ this is not JSON too
 				[]byte(`{"log":"1:M 09 Nov 13:27:36.276 # User requested shutdown...","stream":"stdout","time":"2017-11-09T13:27:36.277747246Z"}
 {"log":"1:M 09 Nov 13:28:36.276 # User requested shutdown...","stream":"stdout","time":"2017-11-09T13:28:36.277747246Z"}
 {"log":"1:M 09 Nov 13:28:54.276 # User requested shutdown...","stream":"stdout","time":"2017-11-09T13:28:54.277747246Z"}`),
-				[]byte(`{"log":"1:M 09 Nov 14:27:36.276 # User requested shutdown... success","stream":"stdout","time":"2017-11-09T14:27:36.277747246Z"}
-{"log":"1:M 09 Nov 14:28:36.276 # User requested shutdown... failed","stream":"stdout","time":"2017-11-09T14:28:36.277747246Z"}
-{"log":"1:M 09 Nov 14:28:54.276 # User requested shutdown... skipped\n","stream":"stdout","time":"2017-11-09T14:28:54.277747246Z"}`),
+				[]byte(`{"log":"1:M 09 Nov 14:29:36.276 # User requested shutdown... success","stream":"stdout","time":"2017-11-09T14:29:36.277747246Z"}
+{"log":"1:M 09 Nov 14:29:36.276 # User requested shutdown... failed","stream":"stdout","time":"2017-11-09T14:29:36.277747246Z"}
+{"log":"1:M 09 Nov 14:29:54.276 # User requested shutdown... skipped\n","stream":"stdout","time":"2017-11-09T14:29:54.277747246Z"}`),
+				[]byte(`{"log":"1:M 09 Nov 14:30:36.276 # User requested shutdown...","stream":"stdout","time":"2017-11-09T14:30:36.277747246Z"}
+{"log":"1:M 09 Nov 14:30:36.276 # User requested shutdown...","stream":"stdout","time":"2017-11-09T14:30:36.277747246Z"}
+{"log":"1:M 09 Nov 14:30:54.276 # User requested shutdown...\n","stream":"stdout","time":"2017-11-09T14:30:54.277747246Z"}`),
+				[]byte(`{"log":"1:M 09 Nov 14:31:36.276 # User requested shutdown... success","stream":"stdout","time":"2017-11-09T14:31:36.277747246Z"}
+{"log":"1:M 09 Nov 14:31:36.276 # User requested shutdown... failed","stream":"stdout","time":"2017-11-09T14:31:36.277747246Z"}
+{"log":"1:M 09 Nov 14:31:54.276 # User requested shutdown... skipped","stream":"stdout","time":"2017-11-09T14:31:54.277747246Z"}`),
+				[]byte(`{"log":"1:M 09 Nov 14:32:36.276 # User requested shutdown...","stream":"stdout","time":"2017-11-09T14:32:36.277747246Z"}
+{"log":"1:M 09 Nov 14:32:36.276 # User requested shutdown...","stream":"stdout","time":"2017-11-09T14:32:36.277747246Z"}
+{"log":"1:M 09 Nov 14:32:54.276 # User requested shutdown...","stream":"stdout","time":"2017-11-09T14:32:54.277747246Z"}`),
+				[]byte(`{"log":"1:M 09 Nov 14:33:36.276 # User requested shutdown... success","stream":"stdout","time":"2017-11-09T14:33:36.277747246Z"}
+{"log":"1:M 09 Nov 14:33:36.276 # User requested shutdown... failed","stream":"stdout","time":"2017-11-09T14:33:36.277747246Z"}
+{"log":"1:M 09 Nov 14:33:54.276 # User requested shutdown... end\n","stream":"stdout","time":"2017-11-09T14:33:54.277747246Z"}`),
 			},
 			partial: true,
 			stream:  "all",
 			expectedMessages: []reader.Message{
 				{
-					Content: []byte("1:M 09 Nov 13:27:36.276 # User requested shutdown...1:M 09 Nov 13:28:36.276 # User requested shutdown...1:M 09 Nov 13:28:54.276 # User requested shutdown...1:M 09 Nov 14:27:36.276 # User requested shu"),
+					Content: []byte("1:M 09 Nov 13:27:36.276 # User requested shutdown...1:M 09 Nov 13:28:36.276 # User requested shutdown...1:M 09 Nov 13:28:54.276 # User requested shutdown...1:M 09 Nov 14:29:36.276 # User requested shu"),
 					//Fields:  common.MapStr{"stream": "stdout"},
 					Bytes: 749,
+				},
+				{
+					Content: []byte("1:M 09 Nov 14:30:36.276 # User requested shutdown...1:M 09 Nov 14:30:36.276 # User requested shutdown...1:M 09 Nov 14:30:54.276 # User requested shutdown...\n"),
+					//Fields:  common.MapStr{"stream": "stdout"},
+					Bytes: 364,
+				},
+				{
+					Content: []byte("1:M 09 Nov 14:31:36.276 # User requested shutdown... success1:M 09 Nov 14:31:36.276 # User requested shutdown... failed1:M 09 Nov 14:31:54.276 # User requested shutdown... skipped1:M 09 Nov 14:32:36.2"),
+					//Fields:  common.MapStr{"stream": "stdout"},
+					Bytes: 747,
 				},
 			},
 		},
