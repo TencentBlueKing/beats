@@ -484,6 +484,14 @@
 			"revisionTime": "2018-10-29T15:41:58Z"
 		},
 		{
+			"checksumSHA1": "e6DhYY4Yo5j/OKsvtJNryZV47f0=",
+			"path": "github.com/bmatcuk/doublestar/v4",
+			"revision": "5da61cf7e690c8998d43f4811467e07b4296a0cb",
+			"revisionTime": "2025-01-25T17:51:34Z",
+			"version": "v4.8.1",
+			"versionExact": "v4.8.1"
+		},
+		{
 			"checksumSHA1": "al43W4TWRdznwfxOWp4egKcL39c=",
 			"path": "github.com/bsm/sarama-cluster",
 			"revision": "7e67d87a6b3f83fe08c096fd084691bd9dca112f",
