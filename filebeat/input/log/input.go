@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4/glob"
 	"github.com/elastic/beats/filebeat/channel"
 	"github.com/elastic/beats/filebeat/harvester"
 	"github.com/elastic/beats/filebeat/input"
@@ -278,9 +279,13 @@ func (p *Input) removeState(state file.State) {
 func (p *Input) getFiles() map[string]os.FileInfo {
 	paths := map[string]os.FileInfo{}
 	uniqFileID := map[string]os.FileInfo{}
+	opts := []glob.GlobOption{
+		glob.WithFollowSymlinks(true),  // 关键配置：允许跟踪符号链接
+		glob.WithFailOnIOErrors(false), // 忽略文件访问错误
+	}
 
 	for _, path := range p.config.Paths {
-		matches, err := filepath.Glob(path)
+		matches, err := glob.Glob("", path, opts...)
 		if err != nil {
 			logp.Err("glob(%s) failed: %v", path, err)
 			continue
