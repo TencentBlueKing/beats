@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//go:build !integration
 // +build !integration
 
 package log
 
 import (
+	"github.com/bmatcuk/doublestar/v4"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -39,6 +42,74 @@ func TestInputFileExclude(t *testing.T) {
 
 	assert.True(t, p.isFileExcluded("/tmp/log/logw.gz"))
 	assert.False(t, p.isFileExcluded("/tmp/log/logw.log"))
+}
+
+func TestGlobWithSymlinks(t *testing.T) {
+	/*
+		创建文件夹 /tmp
+		目录结构示例
+		/tmp
+		├── data/
+		│   ├── app.log
+		│   ├── subdir/
+		│   │   └── api.log
+		│   └── link_logs -> /external/logs  //容器内软链接，链接到相对目录
+		└── external/
+			└── logs/
+				├── system.log
+				└── old/
+					└── system.log
+	*/
+
+	tmpDir := t.TempDir()
+
+	// 主数据目录结构
+	dataDir := filepath.Join(tmpDir, "data")
+	os.MkdirAll(dataDir, 0755)
+	os.WriteFile(filepath.Join(dataDir, "app.log"), []byte("test"), 0644)
+	os.Mkdir(filepath.Join(dataDir, "subdir"), 0755)
+	os.WriteFile(filepath.Join(dataDir, "subdir", "api.log"), []byte("test"), 0644)
+
+	// 外部日志目录（软链目标）
+	externalLogsDir := filepath.Join(tmpDir, "external", "logs")
+	os.MkdirAll(externalLogsDir, 0755)
+	os.WriteFile(filepath.Join(externalLogsDir, "system.log"), []byte("test"), 0644)
+	os.Mkdir(filepath.Join(externalLogsDir, "old"), 0755)
+	os.WriteFile(filepath.Join(externalLogsDir, "old", "system.log"), []byte("test"), 0644)
+
+	// 创建软链：data/link_logs -> external/logs
+	os.Symlink(filepath.Join("external", "logs"), filepath.Join(dataDir, "link_logs"))
+
+	// 构建模式
+	pattern := filepath.Join("**", "*.log")
+	matches, err := doublestar.Glob(os.DirFS(tmpDir), pattern, doublestar.WithFilesOnly())
+	if err != nil {
+		t.Fatalf("Glob failed: %v", err)
+	}
+
+	expected := []string{
+		filepath.Join(dataDir, "app.log"),
+		filepath.Join(dataDir, "subdir", "api.log"),
+		filepath.Join(tmpDir, "external", "logs", "system.log"),        // 软链直接文件
+		filepath.Join(tmpDir, "external", "logs", "old", "system.log"), // 软链子目录文件
+	}
+
+	if len(matches) != len(expected) {
+		t.Fatalf("Expected %d matches, got %d", len(expected), len(matches))
+	}
+
+	for _, exp := range expected {
+		found := false
+		for _, m := range matches {
+			if filepath.Join(tmpDir, m) == exp {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Expected match not found: %s", exp)
+		}
+	}
 }
 
 var cleanInactiveTests = []struct {

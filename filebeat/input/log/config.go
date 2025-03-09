@@ -74,6 +74,12 @@ var (
 	}
 )
 
+// MountInfo 文件系统挂载信息
+type MountInfo struct {
+	hostPath      string
+	containerPath string
+}
+
 type config struct {
 	harvester.ForwarderConfig `config:",inline"`
 	LogConfig                 `config:",inline"`
@@ -117,7 +123,11 @@ type config struct {
 	} `config:"docker-json"`
 
 	// ludicrous mode, the collection speed of the single-line-log can reach 100+MB/s !!!
-	LudicrousMode bool `config:"ludicrous_mode"`
+	LudicrousMode    bool              `config:"ludicrous_mode"`
+	RemovePathPrefix string            `config:"remove_path_prefix"` // 去除路径前缀
+	Mounts           []MountInfo       `config:"mounts"`             // 挂载路径信息
+	MountMap         map[string]string // 挂载路径映射
+	MountHostPaths   []string          // 挂载主机排序列表
 }
 
 type LogConfig struct {

@@ -27,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bmatcuk/doublestar/v4/glob"
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/elastic/beats/filebeat/channel"
 	"github.com/elastic/beats/filebeat/harvester"
 	"github.com/elastic/beats/filebeat/input"
@@ -279,16 +279,40 @@ func (p *Input) removeState(state file.State) {
 func (p *Input) getFiles() map[string]os.FileInfo {
 	paths := map[string]os.FileInfo{}
 	uniqFileID := map[string]os.FileInfo{}
-	opts := []glob.GlobOption{
-		glob.WithFollowSymlinks(true),  // 关键配置：允许跟踪符号链接
-		glob.WithFailOnIOErrors(false), // 忽略文件访问错误
+	opts := []doublestar.GlobOption{
+		doublestar.WithFailOnIOErrors(), // 忽略文件访问错误
+		doublestar.WithFilesOnly(),      // 仅返回文件不返回文件夹
 	}
 
 	for _, path := range p.config.Paths {
-		matches, err := glob.Glob("", path, opts...)
+		// 指定文件系统根路径
+		rootPath := ""
+		containerPath := ""
+		// 如果存在移除前缀配置，说明为容器场景
+		if p.config.RemovePathPrefix != "" {
+			rootPath = p.config.RemovePathPrefix
+			// 从mounts中提取容器根路径
+			for _, mount := range p.config.Mounts {
+				if mount.hostPath == "" {
+					containerPath = mount.containerPath
+					break
+				}
+			}
+			// 判定path中是否存在容器根路径，若存在则rootPath追加
+			if containerPath != "" && strings.HasPrefix(path, filepath.Join(rootPath, containerPath)) {
+				rootPath = filepath.Join(rootPath, containerPath)
+			}
+		}
+		// 计算相对根路径
+		relPath := strings.Replace(path, rootPath, "", 1)
+		matches, err := doublestar.Glob(os.DirFS(rootPath), relPath, opts...)
 		if err != nil {
 			logp.Err("glob(%s) failed: %v", path, err)
 			continue
+		}
+		// 将匹配的文件列表转换为绝对路径
+		for i := range matches {
+			matches[i] = filepath.Join(rootPath, matches[i])
 		}
 
 		// Check any matched files to see if we need to start a harvester
