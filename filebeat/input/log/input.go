@@ -289,22 +289,35 @@ func (p *Input) getFiles() map[string]os.FileInfo {
 		rootPath := ""
 		containerPath := ""
 		// 如果存在移除前缀配置，说明为容器场景
-		if p.config.RemovePathPrefix != "" {
+		if len(p.config.RemovePathPrefix) > 0 {
 			rootPath = p.config.RemovePathPrefix
 			// 从mounts中提取容器根路径
 			for _, mount := range p.config.Mounts {
 				if mount.hostPath == "" {
 					containerPath = mount.containerPath
-					break
+					break // 取第一个符合条件的挂载点
 				}
 			}
-			// 判定path中是否存在容器根路径，若存在则rootPath追加
-			if containerPath != "" && strings.HasPrefix(path, filepath.Join(rootPath, containerPath)) {
-				rootPath = filepath.Join(rootPath, containerPath)
+			// 构建完整容器路径并验证
+			if containerPath != "" {
+				fullContainerPath := filepath.Join(rootPath, containerPath)
+				if strings.HasPrefix(path, fullContainerPath) {
+					rootPath = fullContainerPath
+				}
 			}
 		}
-		// 计算相对根路径
-		relPath := strings.Replace(path, rootPath, "", 1)
+		// 计算相对路径
+		var relPath string
+		if rootPath != "" {
+			var err error
+			if relPath, err = filepath.Rel(rootPath, path); err != nil {
+				logp.Err("路径转换失败 [root:%s][path:%s]: %v", rootPath, path, err)
+				continue
+			}
+		} else {
+			relPath = path // 非容器场景直接使用原路径
+		}
+
 		matches, err := doublestar.Glob(os.DirFS(rootPath), relPath, opts...)
 		if err != nil {
 			logp.Err("glob(%s) failed: %v", path, err)
