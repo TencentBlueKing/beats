@@ -31,7 +31,6 @@ import (
 	"github.com/elastic/beats/filebeat/harvester"
 	"github.com/elastic/beats/filebeat/input/file"
 	"github.com/elastic/beats/libbeat/common/cfgwarn"
-	"github.com/elastic/beats/libbeat/common/file"
 	"github.com/elastic/beats/libbeat/common/match"
 	"github.com/elastic/beats/libbeat/logp"
 	"github.com/elastic/beats/libbeat/reader/multiline"
@@ -295,7 +294,7 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath str
 	// 记录访问过的文件
 	visited[currentPath] = struct{}{}
 
-	fileInfo, err := file.Lstat(currentPath)
+	fileInfo, err := os.Lstat(currentPath)
 
 	if err != nil {
 		// 获取不到文件就拉倒

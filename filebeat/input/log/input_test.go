@@ -33,14 +33,15 @@ import (
 
 func TestGreatestFileMatcher(t *testing.T) {
 	/*
-			  创建文件夹 /data1/test
+			  创建文件夹 /tmp/test
 			  目录结构示例
-			  /data1/test
+			  /tmp/test
 			  ├── file1.txt
 			  ├── file2.txt
 			  ├── subdir
 			  │   └── file3.txt
 			  ├── link_dir -> /cccc/
+			  ├── link_dir2 -> /cccc/
 		      /data1/test2
 			  └── host_space
 				  └── file4.txt
