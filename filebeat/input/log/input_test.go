@@ -15,20 +15,142 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//go:build !integration
 // +build !integration
 
 package log
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-
 	"github.com/elastic/beats/filebeat/input/file"
 	"github.com/elastic/beats/libbeat/common/match"
+	"github.com/stretchr/testify/assert"
 )
+
+func TestGreatestFileMatcher(t *testing.T) {
+	/*
+			  创建文件夹 /data1/test
+			  目录结构示例
+			  /data1/test
+			  ├── file1.txt
+			  ├── file2.txt
+			  ├── subdir
+			  │   └── file3.txt
+			  ├── link_dir -> /cccc/
+		      /data1/test2
+			  └── host_space
+				  └── file4.txt
+	*/
+	if err := os.MkdirAll("/tmp", 0755); err != nil {
+		panic(err)
+	}
+	if err := os.MkdirAll("/tmp/test", 0755); err != nil {
+		panic(err)
+	}
+	// 创建文件 /tmp/test/file1.txt
+	if err := os.WriteFile("/tmp/test/file1.txt", []byte("Hello, World!"), 0644); err != nil {
+		panic(err)
+	}
+	// 创建文件 /tmp/test/file2.txt
+	if err := os.WriteFile("/tmp/test/file2.txt", []byte("Hello, World!"), 0644); err != nil {
+		panic(err)
+	}
+	// 创建文件夹 /tmp/test/subdir
+	if err := os.MkdirAll("/tmp/test/sub_dir", 0755); err != nil {
+		panic(err)
+	}
+	// 创建文件 /tmp/test/subdir/file3.txt
+	if err := os.WriteFile("/tmp/test/sub_dir/file3.txt", []byte("Hello, World!"), 0644); err != nil {
+		panic(err)
+	}
+	// 创建文件夹 /tmp/test/host_space
+	if err := os.MkdirAll("/tmp/test2/host_space", 0755); err != nil {
+		panic(err)
+	}
+	// 创建文件 /tmp/test/host_space/file4.log
+	if err := os.WriteFile("/tmp/test2/host_space/file4.txt", []byte("Hello, World!"), 0644); err != nil {
+		panic(err)
+	}
+	// 创建符号链接 /tmp/test/link_dir/ -> /cccc/  如果有就不创建
+	if _, err := os.Lstat("/tmp/test/link_dir"); err != nil {
+		if err := os.Symlink("/cccc/", "/tmp/test/link_dir"); err != nil {
+			panic(err)
+		}
+	}
+
+	// case 1.1: 基本测试
+	matcher := NewGreatestFileMatcher(nil)
+
+	matches, err := matcher.Glob("/tmp/test/*.txt")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test/file1.txt", "/tmp/test/file2.txt"}, matches)
+
+	// case 1.2: 基本测试
+	matches, err = matcher.Glob("/tmp/test/*/*.txt")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test/sub_dir/file3.txt"}, matches)
+
+	// case 1.3: 基本测试
+	matches, err = matcher.Glob("/xxx/test/*/*.log")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("excepted: %v => actual: %v\n", []string{}, matches)
+
+	// case 2.1: 软链测试
+	matches, err = matcher.Glob("/tmp/test/link_dir/*.txt")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("excepted: %v => actual: %v\n", []string{}, matches)
+
+	// case 2.2: 见证奇迹的时候
+	matcher = NewGreatestFileMatcher([]MountInfo{
+		{
+			hostPath:      "/tmp/test2/host_space/",
+			containerPath: "/cccc/",
+		},
+	})
+	matches, err = matcher.Glob("/tmp/test/link_dir/*.txt")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test2/host_space/file4.txt"}, matches)
+
+	// case 2.3: ...
+	matcher = NewGreatestFileMatcher([]MountInfo{
+		{
+			hostPath:      "/tmp/test2/host_space/",
+			containerPath: "/cccc/",
+		},
+	})
+	matches, err = matcher.Glob("/tmp/test/*/*.txt")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test/sub_dir/file3.txt", "/tmp/test2/host_space/file4.txt"}, matches)
+
+	// case 2.4 ...
+	matcher = NewGreatestFileMatcher([]MountInfo{
+		{
+			hostPath:      "/tmp/test2/host_space/",
+			containerPath: "/cccc/",
+		},
+	})
+	matches, err = matcher.Glob("/cccc/*.txt")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test2/host_space/file4.txt"}, matches)
+}
 
 func TestInputFileExclude(t *testing.T) {
 	p := Input{
