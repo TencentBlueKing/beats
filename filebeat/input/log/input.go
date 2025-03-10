@@ -280,8 +280,7 @@ func (p *Input) getFiles() map[string]os.FileInfo {
 	paths := map[string]os.FileInfo{}
 	uniqFileID := map[string]os.FileInfo{}
 	opts := []doublestar.GlobOption{
-		doublestar.WithFailOnIOErrors(), // 忽略文件访问错误
-		doublestar.WithFilesOnly(),      // 仅返回文件不返回文件夹
+		doublestar.WithFilesOnly(), // 仅返回文件不返回文件夹
 	}
 
 	for _, path := range p.config.Paths {
@@ -316,7 +315,7 @@ func (p *Input) getFiles() map[string]os.FileInfo {
 
 		matches, err := doublestar.Glob(os.DirFS(baseRoot), relPath, opts...)
 		if err != nil {
-			logp.Err("glob(%s) failed: %v", path, err)
+			logp.Err("glob(%s) failed: %v", relPath, err)
 			continue
 		}
 		// 将匹配的文件列表转换为绝对路径

@@ -78,10 +78,10 @@ func TestGlobWithSymlinks(t *testing.T) {
 	os.WriteFile(filepath.Join(externalLogsDir, "old", "system.log"), []byte("test"), 0644)
 
 	// 创建软链：data/link_logs -> external/logs
-	os.Symlink(filepath.Join("external", "logs"), filepath.Join(dataDir, "link_logs"))
+	os.Symlink(filepath.Join(tmpDir, "external", "logs"), filepath.Join(dataDir, "link_logs"))
 
 	// 构建模式
-	pattern := filepath.Join("**", "*.log")
+	pattern := filepath.Join("data", "**", "*.log")
 	matches, err := doublestar.Glob(os.DirFS(tmpDir), pattern, doublestar.WithFilesOnly())
 	if err != nil {
 		t.Fatalf("Glob failed: %v", err)
