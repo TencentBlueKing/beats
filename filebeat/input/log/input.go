@@ -286,46 +286,42 @@ func (p *Input) getFiles() map[string]os.FileInfo {
 
 	for _, path := range p.config.Paths {
 		// 指定文件系统根路径
-		rootPath := ""
-		containerPath := ""
+		baseRoot := ""
+		containerRoot := ""
 		// 如果存在移除前缀配置，说明为容器场景
 		if len(p.config.RemovePathPrefix) > 0 {
-			rootPath = p.config.RemovePathPrefix
+			baseRoot = p.config.RemovePathPrefix
 			// 从mounts中提取容器根路径
 			for _, mount := range p.config.Mounts {
-				if mount.hostPath == "" {
-					containerPath = mount.containerPath
+				if mount.ContainerPath == "" {
+					containerRoot = mount.HostPath
 					break // 取第一个符合条件的挂载点
 				}
 			}
 			// 构建完整容器路径并验证
-			if containerPath != "" {
-				fullContainerPath := filepath.Join(rootPath, containerPath)
+			if containerRoot != "" {
+				fullContainerPath := filepath.Join(baseRoot, containerRoot)
 				if strings.HasPrefix(path, fullContainerPath) {
-					rootPath = fullContainerPath
+					baseRoot = fullContainerPath
 				}
 			}
 		}
 		// 计算相对路径
 		var relPath string
-		if rootPath != "" {
-			var err error
-			if relPath, err = filepath.Rel(rootPath, path); err != nil {
-				logp.Err("路径转换失败 [root:%s][path:%s]: %v", rootPath, path, err)
-				continue
-			}
+		if baseRoot != "" {
+			relPath = strings.Replace(path, baseRoot, "", 1)
 		} else {
 			relPath = path // 非容器场景直接使用原路径
 		}
 
-		matches, err := doublestar.Glob(os.DirFS(rootPath), relPath, opts...)
+		matches, err := doublestar.Glob(os.DirFS(baseRoot), relPath, opts...)
 		if err != nil {
 			logp.Err("glob(%s) failed: %v", path, err)
 			continue
 		}
 		// 将匹配的文件列表转换为绝对路径
 		for i := range matches {
-			matches[i] = filepath.Join(rootPath, matches[i])
+			matches[i] = filepath.Join(baseRoot, matches[i])
 		}
 
 		// Check any matched files to see if we need to start a harvester

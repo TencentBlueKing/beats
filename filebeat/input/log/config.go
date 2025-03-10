@@ -76,8 +76,8 @@ var (
 
 // MountInfo 文件系统挂载信息
 type MountInfo struct {
-	hostPath      string
-	containerPath string
+	HostPath      string `config:"hostpath"`      // 注意字段名和标签的对应关系
+	ContainerPath string `config:"containerpath"`
 }
 
 type config struct {
