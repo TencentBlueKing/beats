@@ -278,9 +278,18 @@ func (p *Input) removeState(state file.State) {
 func (p *Input) getFiles() map[string]os.FileInfo {
 	paths := map[string]os.FileInfo{}
 	uniqFileID := map[string]os.FileInfo{}
-	matcher := NewGreatestFileMatcher(p.config.Mounts)
+	matcher := NewGreatestFileMatcher(p.config.RemovePathPrefix, p.config.Mounts)
 	for _, path := range p.config.Paths {
-		matches, err := matcher.Glob(path)
+		var matches []string
+		var err error
+		if len(p.config.RemovePathPrefix) > 0 {
+			// 容器场景
+			matches, err = matcher.Glob(path)
+		} else {
+			// 物理机场景
+			matches, err = filepath.Glob(path)
+		}
+
 		if err != nil {
 			logp.Err("glob(%s) failed: %v", path, err)
 			continue

@@ -41,8 +41,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 			  ├── subdir
 			  │   └── file3.txt
 			  ├── link_dir -> /cccc/
-			  ├── link_dir2 -> /cccc/
-		      /data1/test2
+		      /tmp/test2
 			  └── host_space
 				  └── file4.txt
 	*/
@@ -84,7 +83,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	}
 
 	// case 1.1: 基本测试
-	matcher := NewGreatestFileMatcher(nil)
+	matcher := NewGreatestFileMatcher("", nil)
 
 	matches, err := matcher.Glob("/tmp/test/*.txt")
 	if err != nil {
@@ -106,18 +105,22 @@ func TestGreatestFileMatcher(t *testing.T) {
 	}
 	fmt.Printf("excepted: %v => actual: %v\n", []string{}, matches)
 
-	// case 2.1: 软链测试
+	// case 2.1.1: 基本软链测试
 	matches, err = matcher.Glob("/tmp/test/link_dir/*.txt")
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("excepted: %v => actual: %v\n", []string{}, matches)
 
+	// case 2.1.2: 指定根目录软链测试
+	matcher = NewGreatestFileMatcher("/tmp/test", nil)
+	matches, err = matcher.Glob("/link_dir/*.txt")
+
 	// case 2.2: 见证奇迹的时候
-	matcher = NewGreatestFileMatcher([]MountInfo{
+	matcher = NewGreatestFileMatcher("", []MountInfo{
 		{
-			hostPath:      "/tmp/test2/host_space/",
-			containerPath: "/cccc/",
+			HostPath:      "/tmp/test2/host_space",
+			ContainerPath: "/cccc",
 		},
 	})
 	matches, err = matcher.Glob("/tmp/test/link_dir/*.txt")
@@ -127,10 +130,10 @@ func TestGreatestFileMatcher(t *testing.T) {
 	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.3: ...
-	matcher = NewGreatestFileMatcher([]MountInfo{
+	matcher = NewGreatestFileMatcher("", []MountInfo{
 		{
-			hostPath:      "/tmp/test2/host_space/",
-			containerPath: "/cccc/",
+			HostPath:      "/tmp/test2/host_space",
+			ContainerPath: "/cccc",
 		},
 	})
 	matches, err = matcher.Glob("/tmp/test/*/*.txt")
@@ -140,10 +143,10 @@ func TestGreatestFileMatcher(t *testing.T) {
 	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test/sub_dir/file3.txt", "/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.4 ...
-	matcher = NewGreatestFileMatcher([]MountInfo{
+	matcher = NewGreatestFileMatcher("/tmp/test", []MountInfo{
 		{
-			hostPath:      "/tmp/test2/host_space/",
-			containerPath: "/cccc/",
+			HostPath:      "/tmp/test2/host_space",
+			ContainerPath: "/cccc",
 		},
 	})
 	matches, err = matcher.Glob("/cccc/*.txt")
@@ -151,6 +154,20 @@ func TestGreatestFileMatcher(t *testing.T) {
 		panic(err)
 	}
 	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test2/host_space/file4.txt"}, matches)
+
+	// case 2.5 容器根目录转换
+	matcher = NewGreatestFileMatcher("/tmp/test", []MountInfo{
+		{
+			HostPath:      "/tmp/test2/host_space",
+			ContainerPath: "/cccc",
+		},
+	})
+	matches, err = matcher.Glob("/*/*.txt")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test2/host_space/file4.txt", "/tmp/test/sub_dir/file3.txt"}, matches)
+
 }
 
 func TestInputFileExclude(t *testing.T) {
