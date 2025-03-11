@@ -22,7 +22,12 @@ package log
 
 import (
 	"fmt"
+	"io/ioutil"
+	"math/rand"
 	"os"
+	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"testing"
 	"time"
 
@@ -30,6 +35,159 @@ import (
 	"github.com/elastic/beats/libbeat/common/match"
 	"github.com/stretchr/testify/assert"
 )
+
+const (
+	totalFiles   = 100000 // 十万个文件
+	maxDepth     = 2      // 最大目录层级
+	baseDir      = "/tmp/logs"
+	matchPattern = "/tmp/logs/*/*/*.log"
+)
+
+// 生成随机目录结构
+func generateRandomPath(r *rand.Rand, depth int) string {
+	if depth > maxDepth {
+		return ""
+	}
+
+	path := baseDir
+	for i := 0; i < 2; i++ { // 确保至少两层目录
+		dir := fmt.Sprintf("dir%d", r.Intn(1000))
+		path = filepath.Join(path, dir)
+		if depth == maxDepth-1 {
+			break
+		}
+		depth++
+	}
+	return path
+}
+
+// 初始化测试环境
+func setup() {
+	os.RemoveAll(baseDir)
+	os.MkdirAll(baseDir, 0755)
+
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	sem := make(chan struct{}, 100) // 并发控制
+
+	for i := 0; i < totalFiles; i++ {
+		sem <- struct{}{}
+		go func(i int) {
+			defer func() { <-sem }()
+			path := generateRandomPath(r, 0)
+			os.MkdirAll(path, 0755)
+			fpath := filepath.Join(path, fmt.Sprintf("file%d.log", i))
+			ioutil.WriteFile(fpath, []byte{}, 0644)
+		}(i)
+	}
+
+	// 等待所有goroutine完成
+	for i := 0; i < cap(sem); i++ {
+		sem <- struct{}{}
+	}
+}
+
+// 清理测试环境
+func teardown() {
+	os.RemoveAll(baseDir)
+}
+
+// Benchmark测试
+func BenchmarkFPGlobPerformance(b *testing.B) {
+	//setup()
+	//defer teardown()
+
+	// 生成 CPU Profile
+	f, _ := os.Create("cpu_fp.pprof")
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
+
+	// 生成 Memory Profile
+	mf, _ := os.Create("mem_fp.pprof")
+	defer pprof.WriteHeapProfile(mf)
+
+	b.ResetTimer() // 重置计时器，排除准备时间
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		// 执行模式匹配
+
+		matches, err := filepath.Glob(matchPattern)
+		if err != nil {
+			b.Fatalf("FilePath Glob failed: %v", err)
+		}
+
+		// 验证匹配数量
+		if len(matches) != totalFiles {
+			b.Errorf("Expected %d matches, got %d", totalFiles, len(matches))
+		}
+
+		// 内存统计
+		b.StopTimer()
+		var mstat runtime.MemStats
+		runtime.ReadMemStats(&mstat)
+		b.Logf("HeapAlloc: %.2f MB", float64(mstat.HeapAlloc)/1024/1024)
+		b.StartTimer()
+	}
+}
+
+// Benchmark测试
+func BenchmarkGlobPerformance(b *testing.B) {
+	//setup()
+	//defer teardown()
+
+	// 生成 CPU Profile
+	f, _ := os.Create("cpu_new.pprof")
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
+
+	// 生成 Memory Profile
+	mf, _ := os.Create("mem_new.pprof")
+	defer pprof.WriteHeapProfile(mf)
+
+	b.ResetTimer() // 重置计时器，排除准备时间
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		// 执行模式匹配
+		matcher := NewGreatestFileMatcher("", "", nil)
+
+		matches, err := matcher.Glob(matchPattern)
+		if err != nil {
+			b.Fatalf("NewGreatestFileMatcher Glob failed: %v", err)
+		}
+
+		// 验证匹配数量
+		if len(matches) != totalFiles {
+			b.Errorf("Expected %d matches, got %d", totalFiles, len(matches))
+		}
+
+		// 内存统计
+		b.StopTimer()
+		var mstat runtime.MemStats
+		runtime.ReadMemStats(&mstat)
+		b.Logf("HeapAlloc: %.2f MB", float64(mstat.HeapAlloc)/1024/1024)
+		b.StartTimer()
+	}
+}
+
+// 单元测试验证文件生成
+func TestFileGeneration(t *testing.T) {
+	setup()
+	defer teardown()
+
+	// 验证文件数量
+	var count int
+	filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
+		if !info.IsDir() && filepath.Ext(path) == ".log" {
+			count++
+		}
+		return nil
+	})
+
+	if count != totalFiles {
+		t.Errorf("Expected %d files, got %d", totalFiles, count)
+	}
+}
 
 func TestGreatestFileMatcher(t *testing.T) {
 	/*
@@ -83,7 +241,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	}
 
 	// case 1.1: 基本测试
-	matcher := NewGreatestFileMatcher("", nil)
+	matcher := NewGreatestFileMatcher("", "", nil)
 
 	matches, err := matcher.Glob("/tmp/test/*.txt")
 	if err != nil {
@@ -113,11 +271,11 @@ func TestGreatestFileMatcher(t *testing.T) {
 	fmt.Printf("excepted: %v => actual: %v\n", []string{}, matches)
 
 	// case 2.1.2: 指定根目录软链测试
-	matcher = NewGreatestFileMatcher("/tmp/test", nil)
+	matcher = NewGreatestFileMatcher("/tmp/test", "", nil)
 	matches, err = matcher.Glob("/link_dir/*.txt")
 
 	// case 2.2: 见证奇迹的时候
-	matcher = NewGreatestFileMatcher("", []MountInfo{
+	matcher = NewGreatestFileMatcher("", "", []MountInfo{
 		{
 			HostPath:      "/tmp/test2/host_space",
 			ContainerPath: "/cccc",
@@ -130,7 +288,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.3: ...
-	matcher = NewGreatestFileMatcher("", []MountInfo{
+	matcher = NewGreatestFileMatcher("", "", []MountInfo{
 		{
 			HostPath:      "/tmp/test2/host_space",
 			ContainerPath: "/cccc",
@@ -143,7 +301,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test/sub_dir/file3.txt", "/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.4 ...
-	matcher = NewGreatestFileMatcher("/tmp/test", []MountInfo{
+	matcher = NewGreatestFileMatcher("/tmp/test", "", []MountInfo{
 		{
 			HostPath:      "/tmp/test2/host_space",
 			ContainerPath: "/cccc",
@@ -155,10 +313,10 @@ func TestGreatestFileMatcher(t *testing.T) {
 	}
 	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
-	// case 2.5 容器根目录转换
-	matcher = NewGreatestFileMatcher("/tmp/test", []MountInfo{
+	// case 2.5 主机挂载根目录转换
+	matcher = NewGreatestFileMatcher("/tmp/test", "/tmp", []MountInfo{
 		{
-			HostPath:      "/tmp/test2/host_space",
+			HostPath:      "/test2/host_space",
 			ContainerPath: "/cccc",
 		},
 	})

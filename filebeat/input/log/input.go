@@ -278,7 +278,7 @@ func (p *Input) removeState(state file.State) {
 func (p *Input) getFiles() map[string]os.FileInfo {
 	paths := map[string]os.FileInfo{}
 	uniqFileID := map[string]os.FileInfo{}
-	matcher := NewGreatestFileMatcher(p.config.RemovePathPrefix, p.config.Mounts)
+	matcher := NewGreatestFileMatcher(p.config.RootFS, p.config.RemovePathPrefix, p.config.Mounts)
 	for _, path := range p.config.Paths {
 		var matches []string
 		var err error

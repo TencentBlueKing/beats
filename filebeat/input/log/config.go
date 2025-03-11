@@ -136,6 +136,7 @@ type config struct {
 	// ludicrous mode, the collection speed of the single-line-log can reach 100+MB/s !!!
 	LudicrousMode    bool        `config:"ludicrous_mode"`
 	RemovePathPrefix string      `config:"remove_path_prefix"` // 去除路径前缀
+	RootFS           string      `config:"root_fs"`            // 根目录文件系统
 	Mounts           []MountInfo `config:"mounts"`             // 挂载路径信息
 }
 
@@ -294,14 +295,15 @@ func (m *GreatestFileMatcher) GlobWithCallback(pattern string, callback func(str
 
 	volumeName := filepath.VolumeName(pattern) + string(filepath.Separator)
 
-	return m.walk(patterns, 0, FilePath{Fs: m.rootFs, Path: volumeName}, visited, callback)
+	return m.walk(patterns, 0, FilePath{Fs: m.rootFs, Path: volumeName}, visited, nil, callback)
 }
 
 // walk 遍历目录
-func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath FilePath, visited map[string]struct{}, callback func(string) error) error {
+func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath FilePath, visited map[string]struct{}, fileInfo os.FileInfo, callback func(string) error) error {
 	var err error
 
 	// 切换到正确的文件系统
+	switched := currentPath.Switched
 	currentPath = m.selectFileSystem(currentPath)
 
 	fullPath := currentPath.GetFullPath()
@@ -313,7 +315,17 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 	// 记录访问过的文件
 	visited[fullPath] = struct{}{}
 
-	fileInfo, err := os.Lstat(fullPath)
+	if switched != currentPath.Switched || fileInfo == nil {
+		fileInfo, err = os.Lstat(fullPath)
+	}
+
+	// 匹配深度超过 pattern 数量，说明已经匹配完毕
+	if depth >= len(patterns) {
+		if !fileInfo.IsDir() {
+			return callback(fullPath)
+		}
+		return nil
+	}
 
 	if err != nil {
 		// 获取不到文件就拉倒
@@ -334,7 +346,7 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 			currentPath.Path = filepath.Join(filepath.Dir(currentPath.Path), link)
 		}
 		// 平级再次遍历
-		return m.walk(patterns, depth, currentPath, visited, callback)
+		return m.walk(patterns, depth, currentPath, visited, nil, callback)
 	}
 
 	// 如果是目录，继续遍历
@@ -365,8 +377,9 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 				Switched: currentPath.Switched,
 			}
 
+			nextFileInfo, _ := dirEntry.Info()
 			// 遍历目录
-			err = m.walk(patterns, depth+1, nextPath, visited, callback)
+			err = m.walk(patterns, depth+1, nextPath, visited, nextFileInfo, callback)
 			if err != nil {
 				return err
 			}
@@ -379,13 +392,9 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 				Fs:       currentPath.Fs,
 				Path:     filepath.Join(currentPath.Path, pattern),
 				Switched: currentPath.Switched,
-			}, visited, callback)
+			}, visited, nil, callback)
 		}
-	}
-
-	// 匹配深度超过 pattern 数量，说明已经匹配完毕
-	if depth >= len(patterns) {
-		return callback(fullPath)
+		return nil
 	}
 
 	return err
@@ -453,14 +462,15 @@ func appendSeparator(path string) string {
 	return path
 }
 
-func NewGreatestFileMatcher(rootFs string, mounts []MountInfo) *GreatestFileMatcher {
+func NewGreatestFileMatcher(rootFs string, hostRoot string, mounts []MountInfo) *GreatestFileMatcher {
 	// 根据 ContainerPath 文件路径的层级，从长到短对 Mounts 进行排序
 	sort.Slice(mounts, func(i, j int) bool {
 		return len(splitPath(mounts[i].ContainerPath)) > len(splitPath(mounts[j].ContainerPath))
 	})
-	for _, mount := range mounts {
-		mount.ContainerPath = appendSeparator(mount.ContainerPath)
-		mount.HostPath = appendSeparator(mount.HostPath)
+	// 补充分隔符 & 主机挂载根目录
+	for idx, mount := range mounts {
+		mounts[idx].ContainerPath = appendSeparator(mount.ContainerPath)
+		mounts[idx].HostPath = appendSeparator(filepath.Join(hostRoot, mount.HostPath))
 	}
 	return &GreatestFileMatcher{
 		rootFs: rootFs,
