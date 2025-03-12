@@ -317,18 +317,19 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 
 	if switched != currentPath.Switched || fileInfo == nil {
 		fileInfo, err = os.Lstat(fullPath)
+		if err != nil {
+			// 获取不到文件就拉倒
+			logp.Debug("input", "[Glob func] File was not found: %s", fullPath)
+			return nil
+		}
 	}
 
 	// 匹配深度超过 pattern 数量，说明已经匹配完毕
 	if depth >= len(patterns) {
+		logp.Debug("input", "[Glob func] Depth is : %v, File is dir: %s", depth, fullPath)
 		if !fileInfo.IsDir() {
 			return callback(fullPath)
 		}
-		return nil
-	}
-
-	if err != nil {
-		// 获取不到文件就拉倒
 		return nil
 	}
 
