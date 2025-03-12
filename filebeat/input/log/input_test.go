@@ -247,28 +247,28 @@ func TestGreatestFileMatcher(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test/file1.txt", "/tmp/test/file2.txt"}, matches)
+	assert.Equal(t, []string{"/private/tmp/test/file1.txt", "/private/tmp/test/file2.txt"}, matches)
 
 	// case 1.2: 基本测试
 	matches, err = matcher.Glob("/tmp/test/*/*.txt")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test/sub_dir/file3.txt"}, matches)
+	assert.Equal(t, []string{"/private/tmp/test/sub_dir/file3.txt"}, matches)
 
 	// case 1.3: 基本测试
 	matches, err = matcher.Glob("/xxx/test/*/*.log")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("excepted: %v => actual: %v\n", []string{}, matches)
+	assert.Equal(t, []string{}, matches)
 
 	// case 2.1.1: 基本软链测试
 	matches, err = matcher.Glob("/tmp/test/link_dir/*.txt")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("excepted: %v => actual: %v\n", []string{}, matches)
+	assert.Equal(t, []string{}, matches)
 
 	// case 2.1.2: 指定根目录软链测试
 	matcher = NewGreatestFileMatcher("/tmp/test", "", nil)
@@ -285,7 +285,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test2/host_space/file4.txt"}, matches)
+	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.3: ...
 	matcher = NewGreatestFileMatcher("", "", []MountInfo{
@@ -294,11 +294,11 @@ func TestGreatestFileMatcher(t *testing.T) {
 			ContainerPath: "/cccc",
 		},
 	})
-	matches, err = matcher.Glob("/tmp/test/*/*.txt")
+	matches, err = matcher.Glob("/tmp/test/*/file4.txt")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test/sub_dir/file3.txt", "/tmp/test2/host_space/file4.txt"}, matches)
+	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.4 ...
 	matcher = NewGreatestFileMatcher("/tmp/test", "", []MountInfo{
@@ -311,7 +311,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test2/host_space/file4.txt"}, matches)
+	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.5 主机挂载根目录转换
 	matcher = NewGreatestFileMatcher("/tmp/test", "/tmp", []MountInfo{
@@ -320,11 +320,24 @@ func TestGreatestFileMatcher(t *testing.T) {
 			ContainerPath: "/cccc",
 		},
 	})
-	matches, err = matcher.Glob("/*/*.txt")
+	matches, err = matcher.Glob("/*/file4.txt")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("excepted: %v => actual: %v\n", []string{"/tmp/test2/host_space/file4.txt", "/tmp/test/sub_dir/file3.txt"}, matches)
+	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
+
+	// case 2.6 文件不存在边界情况
+	matcher = NewGreatestFileMatcher("/tmp/test", "/tmp", []MountInfo{
+		{
+			HostPath:      "/test2/host_space",
+			ContainerPath: "/cccc",
+		},
+	})
+	matches, err = matcher.Glob("/*/no_exist.txt")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("excepted: %v => actual: %v\n", []string{}, matches)
 
 }
 
