@@ -149,7 +149,7 @@ func BenchmarkGlobPerformance(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		// 执行模式匹配
-		matcher := NewGreatestFileMatcher("", "", nil)
+		matcher := NewGreatestFileMatcher("", nil)
 
 		matches, err := matcher.Glob(matchPattern)
 		if err != nil {
@@ -241,7 +241,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	}
 
 	// case 1.1: 基本测试
-	matcher := NewGreatestFileMatcher("", "", nil)
+	matcher := NewGreatestFileMatcher("", nil)
 
 	matches, err := matcher.Glob("/tmp/test/*.txt")
 	if err != nil {
@@ -271,11 +271,11 @@ func TestGreatestFileMatcher(t *testing.T) {
 	assert.Equal(t, []string{}, matches)
 
 	// case 2.1.2: 指定根目录软链测试
-	matcher = NewGreatestFileMatcher("/tmp/test", "", nil)
+	matcher = NewGreatestFileMatcher("/tmp/test", nil)
 	matches, err = matcher.Glob("/link_dir/*.txt")
 
 	// case 2.2: 见证奇迹的时候
-	matcher = NewGreatestFileMatcher("", "", []MountInfo{
+	matcher = NewGreatestFileMatcher("", []MountInfo{
 		{
 			HostPath:      "/tmp/test2/host_space",
 			ContainerPath: "/cccc",
@@ -288,7 +288,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.3: ...
-	matcher = NewGreatestFileMatcher("", "", []MountInfo{
+	matcher = NewGreatestFileMatcher("", []MountInfo{
 		{
 			HostPath:      "/tmp/test2/host_space",
 			ContainerPath: "/cccc",
@@ -301,7 +301,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.4 ...
-	matcher = NewGreatestFileMatcher("/tmp/test", "", []MountInfo{
+	matcher = NewGreatestFileMatcher("/tmp/test", []MountInfo{
 		{
 			HostPath:      "/tmp/test2/host_space",
 			ContainerPath: "/cccc",
@@ -314,22 +314,22 @@ func TestGreatestFileMatcher(t *testing.T) {
 	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.5 主机挂载根目录转换
-	matcher = NewGreatestFileMatcher("/tmp/test", "/tmp", []MountInfo{
+	matcher = NewGreatestFileMatcher("/tmp/test", []MountInfo{
 		{
-			HostPath:      "/test2/host_space",
+			HostPath:      "/tmp/test2/host_space",
 			ContainerPath: "/cccc",
 		},
 	})
-	matches, err = matcher.Glob("/*/file4.txt")
+	matches, err = matcher.Glob("/*/*")
 	if err != nil {
 		panic(err)
 	}
 	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.6 文件不存在边界情况
-	matcher = NewGreatestFileMatcher("/tmp/test", "/tmp", []MountInfo{
+	matcher = NewGreatestFileMatcher("/tmp/test", []MountInfo{
 		{
-			HostPath:      "/test2/host_space",
+			HostPath:      "/tmp/test2/host_space",
 			ContainerPath: "/cccc",
 		},
 	})

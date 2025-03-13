@@ -463,7 +463,7 @@ func appendSeparator(path string) string {
 	return path
 }
 
-func NewGreatestFileMatcher(rootFs string, hostRoot string, mounts []MountInfo) *GreatestFileMatcher {
+func NewGreatestFileMatcher(rootFs string, mounts []MountInfo) *GreatestFileMatcher {
 	// 根据 ContainerPath 文件路径的层级，从长到短对 Mounts 进行排序
 	sort.Slice(mounts, func(i, j int) bool {
 		return len(splitPath(mounts[i].ContainerPath)) > len(splitPath(mounts[j].ContainerPath))
@@ -471,7 +471,7 @@ func NewGreatestFileMatcher(rootFs string, hostRoot string, mounts []MountInfo) 
 	// 补充分隔符 & 主机挂载根目录
 	for idx, mount := range mounts {
 		mounts[idx].ContainerPath = appendSeparator(mount.ContainerPath)
-		mounts[idx].HostPath = appendSeparator(filepath.Join(hostRoot, mount.HostPath))
+		mounts[idx].HostPath = appendSeparator(mount.HostPath)
 	}
 	return &GreatestFileMatcher{
 		rootFs: rootFs,
