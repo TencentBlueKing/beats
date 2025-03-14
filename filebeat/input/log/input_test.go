@@ -191,17 +191,18 @@ func TestFileGeneration(t *testing.T) {
 
 func TestGreatestFileMatcher(t *testing.T) {
 	/*
-			  创建文件夹 /tmp/test
-			  目录结构示例
-			  /tmp/test
-			  ├── file1.txt
-			  ├── file2.txt
-			  ├── subdir
-			  │   └── file3.txt
-			  ├── link_dir -> /cccc/
-		      /tmp/test2
-			  └── host_space
-				  └── file4.txt
+				  创建文件夹 /tmp/test
+				  目录结构示例
+				  /tmp/test
+				  ├── file1.txt
+				  ├── file2.txt
+				  ├── subdir
+				  │   └── file3.txt
+				  ├── link_dir -> /cccc/
+		          ├── link_dir2 -> /test2/host_space/
+			      /tmp/test2
+				  └── host_space
+					  └── file4.txt
 	*/
 	if err := os.MkdirAll("/tmp", 0755); err != nil {
 		panic(err)
@@ -239,6 +240,12 @@ func TestGreatestFileMatcher(t *testing.T) {
 			panic(err)
 		}
 	}
+	// 创建符号链接 /tmp/test/link_dir2/ -> /test2/host_space/ 如果有就不创建
+	if _, err := os.Lstat("/tmp/test/link_dir2"); err != nil {
+		if err := os.Symlink("/test2/host_space/", "/tmp/test/link_dir2"); err != nil {
+			panic(err)
+		}
+	}
 
 	// case 1.1: 基本测试
 	matcher := NewGreatestFileMatcher("", nil)
@@ -271,8 +278,9 @@ func TestGreatestFileMatcher(t *testing.T) {
 	assert.Equal(t, []string{}, matches)
 
 	// case 2.1.2: 指定根目录软链测试
-	matcher = NewGreatestFileMatcher("/tmp/test", nil)
-	matches, err = matcher.Glob("/link_dir/*.txt")
+	matcher = NewGreatestFileMatcher("/tmp", nil)
+	matches, err = matcher.Glob("/test/link_dir2/*.txt*")
+	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.2: 见证奇迹的时候
 	matcher = NewGreatestFileMatcher("", []MountInfo{
@@ -324,7 +332,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
+	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt", "/tmp/test/sub_dir/file3.txt"}, matches)
 
 	// case 2.6 文件不存在边界情况
 	matcher = NewGreatestFileMatcher("/tmp/test", []MountInfo{
@@ -338,7 +346,6 @@ func TestGreatestFileMatcher(t *testing.T) {
 		panic(err)
 	}
 	fmt.Printf("excepted: %v => actual: %v\n", []string{}, matches)
-
 }
 
 func TestInputFileExclude(t *testing.T) {
