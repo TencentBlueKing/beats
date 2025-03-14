@@ -335,8 +335,8 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 		return nil
 	}
 
-	// 检查是否是符号链接
-	if fileInfo.Mode()&os.ModeSymlink != 0 {
+	// 检查是否是符号链接，如果为根路径不做解析，避免循环记录
+	if fileInfo.Mode()&os.ModeSymlink != 0 && fullPath != currentPath.Fs {
 		// 获取链接指向的实际路径
 		link, err := os.Readlink(fullPath)
 		if err != nil {
@@ -354,7 +354,7 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 	}
 
 	// 如果是目录，继续遍历
-	if fileInfo.IsDir() {
+	if fileInfo.IsDir() || fullPath == currentPath.Fs {
 		// 当前层级的匹配模式
 		pattern := patterns[depth]
 
