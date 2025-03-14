@@ -289,6 +289,7 @@ func (p *Input) getFiles() map[string]os.FileInfo {
 			// 物理机场景
 			matches, err = filepath.Glob(path)
 		}
+		logp.Debug("input", "[Glob Func] Path: %s, Matched files: %s", path, strings.Join(matches, ", "))
 
 		if err != nil {
 			logp.Err("glob(%s) failed: %v", path, err)

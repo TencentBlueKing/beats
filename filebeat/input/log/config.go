@@ -306,10 +306,12 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 	switched := currentPath.Switched
 	currentPath = m.selectFileSystem(currentPath)
 
+	// Todo: root fs存在软链的情况
 	fullPath := currentPath.GetFullPath()
 
 	// 避免重复访问
 	if _, ok := visited[fullPath]; ok {
+		logp.Debug("input", "[Glob func] File was visited: %s", fullPath)
 		return nil
 	}
 	// 记录访问过的文件
@@ -338,6 +340,7 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 		// 获取链接指向的实际路径
 		link, err := os.Readlink(fullPath)
 		if err != nil {
+			logp.Debug("input", "[Glob func] Get link failed: %s", fullPath)
 			return err
 		}
 		// 如果是软链，替换为软链指向的路径
