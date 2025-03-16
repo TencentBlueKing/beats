@@ -70,7 +70,8 @@ var (
 			CloseEOF:      false,
 			CloseTimeout:  0,
 		},
-		LudicrousMode: false,
+		LudicrousMode:  false,
+		FileIdentifier: file.IdentifierInode,
 	}
 )
 
@@ -118,6 +119,11 @@ type config struct {
 
 	// ludicrous mode, the collection speed of the single-line-log can reach 100+MB/s !!!
 	LudicrousMode bool `config:"ludicrous_mode"`
+
+	// FileIdentifier how to identify same file in the registry
+	// choose between: inode, inode_path, path
+	// inode is the default
+	FileIdentifier string `config:"file_identifier"`
 }
 
 type LogConfig struct {

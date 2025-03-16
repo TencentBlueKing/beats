@@ -28,34 +28,43 @@ import (
 	"github.com/elastic/beats/libbeat/common/file"
 )
 
+// Identifier how to identify same file in the registry
+const (
+	IdentifierPath      = "path"
+	IdentifierInodePath = "inode_path"
+	IdentifierInode     = "inode"
+)
+
 // State is used to communicate the reading state of a file
 type State struct {
-	Id          string            `json:"-"` // local unique id to make comparison more efficient
-	Finished    bool              `json:"-"` // harvester state
-	Fileinfo    os.FileInfo       `json:"-"` // the file info
-	Source      string            `json:"source"`
-	Offset      int64             `json:"offset"`
-	Timestamp   time.Time         `json:"timestamp"`
-	TTL         time.Duration     `json:"ttl"`
-	Type        string            `json:"type"`
-	Meta        map[string]string `json:"meta"`
-	FileStateOS file.StateOS
+	Id             string            `json:"-"` // local unique id to make comparison more efficient
+	Finished       bool              `json:"-"` // harvester state
+	Fileinfo       os.FileInfo       `json:"-"` // the file info
+	FileIdentifier string            `json:"-"` // file identifier
+	Source         string            `json:"source"`
+	Offset         int64             `json:"offset"`
+	Timestamp      time.Time         `json:"timestamp"`
+	TTL            time.Duration     `json:"ttl"`
+	Type           string            `json:"type"`
+	Meta           map[string]string `json:"meta"`
+	FileStateOS    file.StateOS
 }
 
 // NewState creates a new file state
-func NewState(fileInfo os.FileInfo, path string, t string, meta map[string]string) State {
+func NewState(fileInfo os.FileInfo, path string, t string, meta map[string]string, fileIdentifier string) State {
 	if len(meta) == 0 {
 		meta = nil
 	}
 	return State{
-		Fileinfo:    fileInfo,
-		Source:      path,
-		Finished:    false,
-		FileStateOS: file.GetOSState(fileInfo),
-		Timestamp:   time.Now(),
-		TTL:         -1, // By default, state does have an infinite ttl
-		Type:        t,
-		Meta:        meta,
+		Fileinfo:       fileInfo,
+		FileIdentifier: fileIdentifier,
+		Source:         path,
+		Finished:       false,
+		FileStateOS:    file.GetOSState(fileInfo),
+		Timestamp:      time.Now(),
+		TTL:            -1, // By default, state does have an infinite ttl
+		Type:           t,
+		Meta:           meta,
 	}
 }
 
@@ -63,15 +72,25 @@ func NewState(fileInfo os.FileInfo, path string, t string, meta map[string]strin
 func (s *State) ID() string {
 	// Generate id on first request. This is needed as id is not set when converting back from json
 	if s.Id == "" {
+		var fileID string
+		switch s.FileIdentifier {
+		case IdentifierPath:
+			fileID = s.Source
+		case IdentifierInodePath:
+			fileID = s.FileStateOS.String() + ":" + s.Source
+		case IdentifierInode:
+			fileID = s.FileStateOS.String()
+		default:
+			// fileIdentifier is neither path nor inode_path, use inode default
+			fileID = s.FileStateOS.String()
+		}
 		if len(s.Meta) == 0 {
-			s.Id = s.FileStateOS.String()
+			s.Id = fileID
 		} else {
 			hashValue, _ := hashstructure.Hash(s.Meta, nil)
 			var hashBuf [17]byte
 			hash := strconv.AppendUint(hashBuf[:0], hashValue, 16)
 			hash = append(hash, '-')
-
-			fileID := s.FileStateOS.String()
 
 			var b strings.Builder
 			b.Grow(len(hash) + len(fileID))

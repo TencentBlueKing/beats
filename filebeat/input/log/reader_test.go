@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//go:build !integration
 // +build !integration
 
 package log
@@ -188,7 +189,7 @@ func getHarvester(filePath string, offset int64) (*Harvester, error) {
 	if err != nil {
 		return nil, err
 	}
-	fileState := file.NewState(fileInfo, filePath, "log", nil)
+	fileState := file.NewState(fileInfo, filePath, "log", nil, file.IdentifierInode)
 	fileState.Offset = offset
 	h.state = fileState
 	return h, nil
