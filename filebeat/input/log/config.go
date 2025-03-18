@@ -73,7 +73,8 @@ var (
 			CloseEOF:      false,
 			CloseTimeout:  0,
 		},
-		LudicrousMode: false,
+		LudicrousMode:  false,
+		FileIdentifier: file.IdentifierInode,
 	}
 )
 
@@ -134,7 +135,14 @@ type config struct {
 	} `config:"docker-json"`
 
 	// ludicrous mode, the collection speed of the single-line-log can reach 100+MB/s !!!
-	LudicrousMode    bool        `config:"ludicrous_mode"`
+	LudicrousMode bool `config:"ludicrous_mode"`
+
+	// FileIdentifier how to identify same file in the registry
+	// choose between: inode, inode_path, path
+	// inode is the default
+	FileIdentifier string `config:"file_identifier"`
+
+	// 一组用于采集路径解析的配置
 	RemovePathPrefix string      `config:"remove_path_prefix"` // 去除路径前缀
 	RootFS           string      `config:"root_fs"`            // 根目录文件系统
 	Mounts           []MountInfo `config:"mounts"`             // 挂载路径信息
