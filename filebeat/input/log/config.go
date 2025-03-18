@@ -277,7 +277,7 @@ func (f *FilePath) GetFullPath() string {
 
 // GreatestFileMatcher 地表最强支持多文件系统的文件匹配器
 type GreatestFileMatcher struct {
-	RootFs string
+	rootFs string
 	mounts []MountInfo
 }
 
