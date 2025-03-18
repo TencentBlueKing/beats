@@ -144,7 +144,7 @@ type config struct {
 
 	// 一组用于采集路径解析的配置
 	RemovePathPrefix string      `config:"remove_path_prefix"` // 去除路径前缀
-	RootFS           string      `config:"root_fs"`            // 根目录文件系统
+	RootFs           string      `config:"root_fs"`            // 根目录文件系统
 	Mounts           []MountInfo `config:"mounts"`             // 挂载路径信息
 }
 
@@ -277,7 +277,7 @@ func (f *FilePath) GetFullPath() string {
 
 // GreatestFileMatcher 地表最强支持多文件系统的文件匹配器
 type GreatestFileMatcher struct {
-	rootFs string
+	RootFs string
 	mounts []MountInfo
 }
 
