@@ -19,7 +19,10 @@ package log
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -75,6 +78,20 @@ var (
 	}
 )
 
+// MountInfo 文件系统挂载信息
+type MountInfo struct {
+	HostPath      string `config:"hostpath"`
+	ContainerPath string `config:"containerpath"`
+}
+
+// FilePath 带文件系统的文件路径
+type FilePath struct {
+	Fs   string
+	Path string
+	// Switched 是否已经切换过文件系统，最多只能切换一次
+	Switched bool
+}
+
 type config struct {
 	harvester.ForwarderConfig `config:",inline"`
 	LogConfig                 `config:",inline"`
@@ -124,6 +141,11 @@ type config struct {
 	// choose between: inode, inode_path, path
 	// inode is the default
 	FileIdentifier string `config:"file_identifier"`
+
+	// 一组用于采集路径解析的配置
+	RemovePathPrefix string      `config:"remove_path_prefix"` // 去除路径前缀
+	RootFs           string      `config:"root_fs"`            // 根目录文件系统
+	Mounts           []MountInfo `config:"mounts"`             // 挂载路径信息
 }
 
 type LogConfig struct {
@@ -246,4 +268,224 @@ func (c *config) normalizeGlobPatterns() error {
 func (c *config) IsLudicrousModeActivated() bool {
 	inSingleLineScene := c.JSON == nil && c.Multiline == nil
 	return c.LudicrousMode && inSingleLineScene
+}
+
+// GetFullPath 获取完整路径
+func (f *FilePath) GetFullPath() string {
+	return filepath.Join(f.Fs, f.Path)
+}
+
+// GreatestFileMatcher 地表最强支持多文件系统的文件匹配器
+type GreatestFileMatcher struct {
+	RootFs string
+	mounts []MountInfo
+}
+
+// Glob 根据 pattern 匹配，并返回匹配的路径的列表
+func (m *GreatestFileMatcher) Glob(pattern string) ([]string, error) {
+	matches := make([]string, 0)
+	err := m.GlobWithCallback(pattern, func(path string) error {
+		matches = append(matches, path)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return matches, nil
+}
+
+// GlobWithCallback 根据 pattern 匹配，并将匹配的路径传给 callback 函数
+func (m *GreatestFileMatcher) GlobWithCallback(pattern string, callback func(string) error) error {
+	// 已经访问过的文件
+	visited := map[string]struct{}{}
+	// 对 pattern 进行目录层级拆解
+	patterns := splitPath(pattern)
+
+	volumeName := filepath.VolumeName(pattern) + string(filepath.Separator)
+
+	return m.walk(patterns, 0, FilePath{Fs: m.rootFs, Path: volumeName}, visited, nil, callback)
+}
+
+// walk 遍历目录
+func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath FilePath, visited map[string]struct{}, fileInfo os.FileInfo, callback func(string) error) error {
+	var err error
+
+	// 切换到正确的文件系统
+	switched := currentPath.Switched
+	currentPath = m.selectFileSystem(currentPath)
+
+	// Todo: root fs存在软链的情况
+	fullPath := currentPath.GetFullPath()
+
+	// 避免重复访问
+	if _, ok := visited[fullPath]; ok {
+		logp.Debug("input", "[Glob func] File was visited: %s", fullPath)
+		return nil
+	}
+	// 记录访问过的文件
+	visited[fullPath] = struct{}{}
+
+	if switched != currentPath.Switched || fileInfo == nil {
+		fileInfo, err = os.Lstat(fullPath)
+		if err != nil {
+			// 获取不到文件就拉倒
+			logp.Debug("input", "[Glob func] File was not found: %s", fullPath)
+			return nil
+		}
+	}
+
+	// 匹配深度超过 pattern 数量，说明已经匹配完毕
+	if depth >= len(patterns) {
+		logp.Debug("input", "[Glob func] Depth is : %v, File is dir: %s", depth, fullPath)
+		if !fileInfo.IsDir() {
+			return callback(fullPath)
+		}
+		return nil
+	}
+
+	// 检查是否是符号链接，如果为根路径不做解析，避免循环记录
+	if fileInfo.Mode()&os.ModeSymlink != 0 && fullPath != currentPath.Fs {
+		// 获取链接指向的实际路径
+		link, err := os.Readlink(fullPath)
+		if err != nil {
+			logp.Debug("input", "[Glob func] Get link failed: %s", fullPath)
+			return err
+		}
+		// 如果是软链，替换为软链指向的路径
+		if filepath.IsAbs(link) {
+			currentPath.Path = link
+		} else {
+			currentPath.Path = filepath.Join(filepath.Dir(currentPath.Path), link)
+		}
+		// 平级再次遍历
+		return m.walk(patterns, depth, currentPath, visited, nil, callback)
+	}
+
+	// 如果是目录，继续遍历
+	if fileInfo.IsDir() || fullPath == currentPath.Fs {
+		// 当前层级的匹配模式
+		pattern := patterns[depth]
+
+		// 遍历目录
+		dirEntries, err := os.ReadDir(fullPath)
+		if err != nil {
+			return err
+		}
+
+		anyMatch := false
+		for _, dirEntry := range dirEntries {
+			// 匹配规则
+			matched, err := filepath.Match(pattern, dirEntry.Name())
+			if err != nil {
+				return err
+			}
+			if !matched {
+				continue
+			}
+
+			nextPath := FilePath{
+				Fs:       currentPath.Fs,
+				Path:     filepath.Join(currentPath.Path, dirEntry.Name()),
+				Switched: currentPath.Switched,
+			}
+
+			nextFileInfo, _ := dirEntry.Info()
+			// 遍历目录
+			err = m.walk(patterns, depth+1, nextPath, visited, nextFileInfo, callback)
+			if err != nil {
+				return err
+			}
+			anyMatch = true
+		}
+
+		if !anyMatch {
+			// 读不到也进去，死马当活马医，万一能跟挂载匹配上呢
+			return m.walk(patterns, depth+1, FilePath{
+				Fs:       currentPath.Fs,
+				Path:     filepath.Join(currentPath.Path, pattern),
+				Switched: currentPath.Switched,
+			}, visited, nil, callback)
+		}
+		return nil
+	}
+
+	return err
+}
+
+// selectFileSystem 根据路径前缀自动配置文件系统
+func (m *GreatestFileMatcher) selectFileSystem(dir FilePath) FilePath {
+	if len(m.mounts) == 0 {
+		return dir
+	}
+
+	if dir.Switched {
+		// 已经切换过了，就无需处理
+		return dir
+	}
+
+	// 先做路径标准化
+	dirWithSuffix := appendSeparator(dir.Path)
+
+	for _, mount := range m.mounts {
+		if strings.HasPrefix(dirWithSuffix, mount.ContainerPath) {
+			dir.Fs = mount.HostPath
+			dir.Path = strings.Replace(dirWithSuffix, mount.ContainerPath, string(filepath.Separator), 1)
+			dir.Switched = true
+			return dir
+		}
+	}
+	return dir
+}
+
+// splitPath 将路径分割为多个部分
+func splitPath(path string) []string {
+	// 1. 标准化路径（处理 ../, ./ 和多余分隔符）
+	cleaned := filepath.Clean(path)
+
+	// 2. 获取卷名（Windows 特性）
+	volume := filepath.VolumeName(cleaned)
+	remaining := cleaned[len(volume):]
+
+	var parts []string
+
+	// 3. 处理 UNC 路径（Windows 网络路径）
+	if strings.HasPrefix(volume, `\\`) {
+		// 分解 UNC 路径的服务器和共享名
+		uncParts := strings.Split(strings.TrimPrefix(volume, `\\`), `\`)
+		parts = append(parts, uncParts...)
+	}
+
+	// 4. 分割剩余路径部分
+	splitFn := func(r rune) bool { return r == filepath.Separator }
+	for _, p := range strings.FieldsFunc(remaining, splitFn) {
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
+
+	return parts
+}
+
+// 给路径末尾补充分隔符
+func appendSeparator(path string) string {
+	if !strings.HasSuffix(path, string(filepath.Separator)) {
+		return path + string(filepath.Separator)
+	}
+	return path
+}
+
+func NewGreatestFileMatcher(rootFs string, mounts []MountInfo) *GreatestFileMatcher {
+	// 根据 ContainerPath 文件路径的层级，从长到短对 Mounts 进行排序
+	sort.Slice(mounts, func(i, j int) bool {
+		return len(splitPath(mounts[i].ContainerPath)) > len(splitPath(mounts[j].ContainerPath))
+	})
+	// 补充分隔符 & 主机挂载根目录
+	for idx, mount := range mounts {
+		mounts[idx].ContainerPath = appendSeparator(mount.ContainerPath)
+		mounts[idx].HostPath = appendSeparator(mount.HostPath)
+	}
+	return &GreatestFileMatcher{
+		rootFs: rootFs,
+		mounts: mounts,
+	}
 }
