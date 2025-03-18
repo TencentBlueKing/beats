@@ -80,8 +80,8 @@ var (
 
 // MountInfo 文件系统挂载信息
 type MountInfo struct {
-	HostPath      string `config:"hostpath"`
-	ContainerPath string `config:"containerpath"`
+	HostPath      string `config:"host_path"`
+	ContainerPath string `config:"container_path"`
 }
 
 // FilePath 带文件系统的文件路径
