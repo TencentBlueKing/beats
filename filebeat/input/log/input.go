@@ -48,6 +48,8 @@ var (
 	filesRenamed     = monitoring.NewInt(nil, "filebeat.input.log.files.renamed")
 	filesTruncated   = monitoring.NewInt(nil, "filebeat.input.log.files.truncated")
 	harvesterSkipped = monitoring.NewInt(nil, "filebeat.harvester.skipped")
+	filesOffsetTotal = monitoring.NewInt(nil, "filebeat.input.log.files.offset_total")
+	filesSizeTotal   = monitoring.NewInt(nil, "filebeat.input.log.files.size_total")
 
 	errHarvesterLimit = errors.New("harvester limit reached")
 )
@@ -468,6 +470,8 @@ func getKeys(paths map[string]os.FileInfo) []string {
 func (p *Input) scan() {
 	var sortInfos []FileSortInfo
 	var files []string
+	var offsetTotal int64
+	var sizeTotal int64
 
 	paths := p.getFiles()
 
@@ -535,7 +539,12 @@ func (p *Input) scan() {
 		} else {
 			p.harvestExistingFile(newState, lastState)
 		}
+		offsetTotal += lastState.Offset
+		sizeTotal += newState.Fileinfo.Size()
 	}
+
+	filesOffsetTotal.Set(offsetTotal)
+	filesSizeTotal.Set(offsetTotal)
 }
 
 // harvestExistingFile continues harvesting a file with a known state if needed
