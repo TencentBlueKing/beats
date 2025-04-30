@@ -538,7 +538,7 @@ func (p *Input) scan() {
 			p.harvestExistingFile(newState, lastState)
 		}
 
-		filesOffsetTotal.Add(newState.Offset)
+		filesOffsetTotal.Add(lastState.Offset)
 		filesSizeTotal.Add(newState.Fileinfo.Size())
 	}
 }
