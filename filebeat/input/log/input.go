@@ -470,8 +470,6 @@ func getKeys(paths map[string]os.FileInfo) []string {
 func (p *Input) scan() {
 	var sortInfos []FileSortInfo
 	var files []string
-	var offsetTotal int64
-	var sizeTotal int64
 
 	paths := p.getFiles()
 
@@ -539,12 +537,10 @@ func (p *Input) scan() {
 		} else {
 			p.harvestExistingFile(newState, lastState)
 		}
-		offsetTotal += lastState.Offset
-		sizeTotal += newState.Fileinfo.Size()
-	}
 
-	filesOffsetTotal.Set(offsetTotal)
-	filesSizeTotal.Set(offsetTotal)
+		filesOffsetTotal.Add(newState.Offset)
+		filesSizeTotal.Add(newState.Fileinfo.Size())
+	}
 }
 
 // harvestExistingFile continues harvesting a file with a known state if needed
