@@ -162,9 +162,10 @@ func NewInput(
 func (p *Input) loadStates(states []file.State) error {
 	logp.Debug("input", "exclude_files: %s. Number of stats: %d", p.config.ExcludeFiles, len(states))
 
+	sources := p.getFiles()
 	for _, state := range states {
 		// Check if state source belongs to this input. If yes, update the state.
-		if p.matchesFile(state.Source) && p.matchesMeta(state.Meta) {
+		if p.matchesFile(state.Source, sources) && p.matchesMeta(state.Meta) {
 			state.TTL = -1
 
 			// In case a input is tried to be started with an unfinished state matching the glob pattern
@@ -349,26 +350,16 @@ func (p *Input) getFiles() map[string]os.FileInfo {
 }
 
 // matchesFile returns true in case the given filePath is part of this input, means matches its glob patterns
-func (p *Input) matchesFile(filePath string) bool {
+func (p *Input) matchesFile(filePath string, sources map[string]os.FileInfo) bool {
 	// Path is cleaned to ensure we always compare clean paths
 	filePath = filepath.Clean(filePath)
 
-	for _, glob := range p.config.Paths {
+	// Evaluate if filePath matches sources key
+	_, match := sources[filePath]
 
-		// Glob is cleaned to ensure we always compare clean paths
-		glob = filepath.Clean(glob)
-
-		// Evaluate if glob matches filePath
-		match, err := filepath.Match(glob, filePath)
-		if err != nil {
-			logp.Debug("input", "Error matching glob: %s", err)
-			continue
-		}
-
-		// Check if file is not excluded
-		if match && !p.isFileExcluded(filePath) {
-			return true
-		}
+	// Check if file is not excluded
+	if match && !p.isFileExcluded(filePath) {
+		return true
 	}
 	return false
 }

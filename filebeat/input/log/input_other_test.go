@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//go:build !windows
 // +build !windows
 
 package log
@@ -83,7 +84,9 @@ func TestMatchFile(t *testing.T) {
 			},
 		}
 
-		assert.Equal(t, test.result, p.matchesFile(test.file))
+		sources := p.getFiles()
+
+		assert.Equal(t, test.result, p.matchesFile(test.file, sources))
 	}
 }
 
