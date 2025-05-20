@@ -48,6 +48,8 @@ var (
 	filesRenamed     = monitoring.NewInt(nil, "filebeat.input.log.files.renamed")
 	filesTruncated   = monitoring.NewInt(nil, "filebeat.input.log.files.truncated")
 	harvesterSkipped = monitoring.NewInt(nil, "filebeat.harvester.skipped")
+	filesOffsetTotal = monitoring.NewInt(nil, "filebeat.input.log.files.offset_total")
+	filesSizeTotal   = monitoring.NewInt(nil, "filebeat.input.log.files.size_total")
 
 	errHarvesterLimit = errors.New("harvester limit reached")
 )
@@ -526,6 +528,9 @@ func (p *Input) scan() {
 		} else {
 			p.harvestExistingFile(newState, lastState)
 		}
+
+		filesOffsetTotal.Add(lastState.Offset)
+		filesSizeTotal.Add(newState.Fileinfo.Size())
 	}
 }
 
