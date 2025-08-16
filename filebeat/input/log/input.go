@@ -34,7 +34,6 @@ import (
 	"github.com/elastic/beats/filebeat/util"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/common/atomic"
-	file_helper "github.com/elastic/beats/libbeat/common/file"
 	"github.com/elastic/beats/libbeat/logp"
 	"github.com/elastic/beats/libbeat/monitoring"
 )
@@ -45,11 +44,13 @@ const (
 )
 
 var (
-	filesRenamed     = monitoring.NewInt(nil, "filebeat.input.log.files.renamed")
-	filesTruncated   = monitoring.NewInt(nil, "filebeat.input.log.files.truncated")
-	harvesterSkipped = monitoring.NewInt(nil, "filebeat.harvester.skipped")
-	filesOffsetTotal = monitoring.NewInt(nil, "filebeat.input.log.files.offset_total")
-	filesSizeTotal   = monitoring.NewInt(nil, "filebeat.input.log.files.size_total")
+	filesRenamed          = monitoring.NewInt(nil, "filebeat.input.log.files.renamed")
+	filesTruncated        = monitoring.NewInt(nil, "filebeat.input.log.files.truncated")
+	harvesterSkipped      = monitoring.NewInt(nil, "filebeat.harvester.skipped")
+	filesOffsetTotal      = monitoring.NewInt(nil, "filebeat.input.log.files.offset_total")
+	filesSizeTotal        = monitoring.NewInt(nil, "filebeat.input.log.files.size_total")
+	filesScanTotal        = monitoring.NewInt(nil, "filebeat.input.log.files.scan_total")
+	filesScanMatchedTotal = monitoring.NewInt(nil, "filebeat.input.log.files.scan_matched_total")
 
 	errHarvesterLimit = errors.New("harvester limit reached")
 )
@@ -304,81 +305,6 @@ func (p *Input) removeState(state file.State) {
 	}
 }
 
-// getFiles returns all files which have to be harvested
-// All globs are expanded and then directory and excluded files are removed
-func (p *Input) getFiles() map[string]os.FileInfo {
-	paths := map[string]os.FileInfo{}
-	uniqFileID := map[string]os.FileInfo{}
-	matcher := NewGreatestFileMatcher(p.config.RootFs, p.config.Mounts)
-	for _, path := range p.config.Paths {
-		var matches []string
-		var err error
-		if p.config.RootFs != "" {
-			// 容器场景
-			matches, err = matcher.Glob(path)
-		} else {
-			// 物理机场景
-			matches, err = filepath.Glob(path)
-		}
-		logp.Debug("input", "[Glob Func] Path: %s, Matched files: %v", path, matches)
-
-		if err != nil {
-			logp.Err("glob(%s) failed: %v", path, err)
-			continue
-		}
-
-		// Check any matched files to see if we need to start a harvester
-		for _, file := range matches {
-
-			// check if the file is in the exclude_files list
-			if p.isFileExcluded(file) {
-				logp.Debug("input", "Exclude file: %s", file)
-				continue
-			}
-
-			// Fetch Lstat File info to detected also symlinks
-			fileInfo, err := os.Lstat(file)
-			if err != nil {
-				logp.Debug("input", "lstat(%s) failed: %s", file, err)
-				continue
-			}
-
-			if fileInfo.IsDir() {
-				logp.Debug("input", "Skipping directory: %s", file)
-				continue
-			}
-
-			isSymlink := fileInfo.Mode()&os.ModeSymlink > 0
-			if isSymlink && !p.config.Symlinks {
-				logp.Debug("input", "File %s skipped as it is a symlink.", file)
-				continue
-			}
-
-			// Fetch Stat file info which fetches the inode. In case of a symlink, the original inode is fetched
-			fileInfo, err = os.Stat(file)
-			if err != nil {
-				logp.Debug("input", "stat(%s) failed: %s", file, err)
-				continue
-			}
-
-			// If symlink is enabled, it is checked that original is not part of same input
-			// It original is harvested by other input, states will potentially overwrite each other
-			if p.config.Symlinks {
-				fileID := file_helper.GetOSState(fileInfo).String()
-				if _, exists := uniqFileID[fileID]; exists {
-					logp.Info("Same file found as symlink and originap. Skipping file: %s", file)
-					continue
-				}
-				uniqFileID[fileID] = fileInfo
-			}
-
-			paths[file] = fileInfo
-		}
-	}
-
-	return paths
-}
-
 // matchesMeta returns true in case the given meta is equal to the one of this input, false if not
 func (p *Input) matchesMeta(meta map[string]string) bool {
 	if len(meta) != len(p.meta) {
@@ -477,11 +403,15 @@ func (p *Input) scan() {
 		var err error
 
 		err = matcher.GlobWithCallback(path, func(file string, fileInfo os.FileInfo) error {
-			// 文件超过过期时间则提前返回，避免加载无用的 state 对象导致内存消耗
-			modTime := fileInfo.ModTime()
-			if time.Since(modTime) > p.config.IgnoreOlder {
-				logp.Debug("input", "Ignore old file: %s, last modified: %v", file, modTime)
-				return nil
+			filesScanTotal.Inc()
+
+			if p.config.IgnoreOlder > 0 {
+				// 文件超过过期时间则提前返回，避免加载无用的 state 对象导致内存消耗
+				modTime := fileInfo.ModTime()
+				if p.config.IgnoreOlder > 0 && time.Since(modTime) > p.config.IgnoreOlder {
+					logp.Debug("input", "Ignore old file: %s, last modified: %v", file, modTime)
+					return nil
+				}
 			}
 
 			// check if the file is in the exclude_files list
@@ -490,6 +420,8 @@ func (p *Input) scan() {
 				return nil
 			}
 
+			filesScanMatchedTotal.Inc()
+
 			newState, err := getFileState(file, fileInfo, p)
 			if err != nil {
 				logp.Err("Skipping file %s due to error %s", path, err)
@@ -497,15 +429,6 @@ func (p *Input) scan() {
 
 			// Load last state
 			lastState := p.states.FindPrevious(newState)
-
-			// Ignores all files which fall under ignore_older
-			if p.isIgnoreOlder(newState) {
-				err := p.handleIgnoreOlder(lastState, newState)
-				if err != nil {
-					logp.Err("Updating ignore_older state error: %s", err)
-				}
-				return nil
-			}
 
 			// Decides if previous state exists
 			if lastState.IsEmpty() {
@@ -597,58 +520,10 @@ func (p *Input) harvestExistingFile(newState file.State, oldState file.State) {
 	}
 }
 
-// handleIgnoreOlder handles states which fall under ignore older
-// Based on the state information it is decided if the state information has to be updated or not
-func (p *Input) handleIgnoreOlder(lastState, newState file.State) error {
-	logp.Debug("input", "Ignore file because ignore_older reached: %s", newState.Source)
-
-	if !lastState.IsEmpty() {
-		if !lastState.Finished {
-			logp.Info("File is falling under ignore_older before harvesting is finished. Adjust your close_* settings: %s", newState.Source)
-		}
-		// Old state exist, no need to update it
-		return nil
-	}
-
-	// Make sure file is not falling under clean_inactive yet
-	if p.isCleanInactive(newState) {
-		logp.Debug("input", "Do not write state for ignore_older because clean_inactive reached")
-		return nil
-	}
-
-	// Set offset to end of file to be consistent with files which were harvested before
-	// See https://github.com/elastic/beats/pull/2907
-	newState.Offset = newState.Fileinfo.Size()
-
-	// Write state for ignore_older file as none exists yet
-	newState.Finished = true
-	err := p.updateState(newState)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // isFileExcluded checks if the given path should be excluded
 func (p *Input) isFileExcluded(file string) bool {
 	patterns := p.config.ExcludeFiles
 	return len(patterns) > 0 && harvester.MatchAny(patterns, file)
-}
-
-// isIgnoreOlder checks if the given state reached ignore_older
-func (p *Input) isIgnoreOlder(state file.State) bool {
-	// ignore_older is disable
-	if p.config.IgnoreOlder == 0 {
-		return false
-	}
-
-	modTime := state.Fileinfo.ModTime()
-	if time.Since(modTime) > p.config.IgnoreOlder {
-		return true
-	}
-
-	return false
 }
 
 // isCleanInactive checks if the given state false under clean_inactive
