@@ -284,7 +284,7 @@ type GreatestFileMatcher struct {
 // Glob 根据 pattern 匹配，并返回匹配的路径的列表
 func (m *GreatestFileMatcher) Glob(pattern string) ([]string, error) {
 	matches := make([]string, 0)
-	err := m.GlobWithCallback(pattern, func(path string) error {
+	err := m.GlobWithCallback(pattern, func(path string, fileInfo os.FileInfo) error {
 		matches = append(matches, path)
 		return nil
 	})
@@ -295,7 +295,7 @@ func (m *GreatestFileMatcher) Glob(pattern string) ([]string, error) {
 }
 
 // GlobWithCallback 根据 pattern 匹配，并将匹配的路径传给 callback 函数
-func (m *GreatestFileMatcher) GlobWithCallback(pattern string, callback func(string) error) error {
+func (m *GreatestFileMatcher) GlobWithCallback(pattern string, callback func(string, os.FileInfo) error) error {
 	// 已经访问过的文件
 	visited := map[string]struct{}{}
 	// 对 pattern 进行目录层级拆解
@@ -307,7 +307,7 @@ func (m *GreatestFileMatcher) GlobWithCallback(pattern string, callback func(str
 }
 
 // walk 遍历目录
-func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath FilePath, visited map[string]struct{}, fileInfo os.FileInfo, callback func(string) error) error {
+func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath FilePath, visited map[string]struct{}, fileInfo os.FileInfo, callback func(string, os.FileInfo) error) error {
 	var err error
 
 	// 切换到正确的文件系统
@@ -338,7 +338,7 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 	if depth >= len(patterns) {
 		logp.Debug("input", "[Glob func] Depth is : %v, File is dir: %s", depth, fullPath)
 		if !fileInfo.IsDir() {
-			return callback(fullPath)
+			return callback(fullPath, fileInfo)
 		}
 		return nil
 	}

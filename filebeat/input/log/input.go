@@ -164,23 +164,51 @@ func NewInput(
 func (p *Input) loadStates(states []file.State) error {
 	logp.Debug("input", "exclude_files: %s. Number of stats: %d", p.config.ExcludeFiles, len(states))
 
-	sources := p.getFiles()
-	for _, state := range states {
-		// Check if state source belongs to this input. If yes, update the state.
-		if p.matchesFile(state.Source, sources) && p.matchesMeta(state.Meta) {
-			state.TTL = -1
+	// 先将 state 按照 source 分组，value 为下标列表，方便后续查找
+	statesBySource := make(map[string][]int)
+	for idx, state := range states {
+		statesBySource[state.Source] = append(statesBySource[state.Source], idx)
+	}
 
-			// In case a input is tried to be started with an unfinished state matching the glob pattern
-			if !state.Finished {
-				return fmt.Errorf("Can only start an input when all related states are finished: %+v", state)
+	matcher := NewGreatestFileMatcher(p.config.RootFs, p.config.Mounts)
+	for _, path := range p.config.Paths {
+		var err error
+
+		err = matcher.GlobWithCallback(path, func(file string, fileInfo os.FileInfo) error {
+			indices, ok := statesBySource[file]
+			if !ok {
+				return nil
 			}
 
-			// Update input states and send new states to registry
-			err := p.updateState(state)
-			if err != nil {
-				logp.Err("Problem putting initial state: %+v", err)
-				return err
+			// check if the file is in the exclude_files list
+			if p.isFileExcluded(file) {
+				logp.Debug("input", "Exclude file: %s", file)
+				return nil
 			}
+
+			for _, idx := range indices {
+				state := states[idx]
+				// Check if state source belongs to this input. If yes, update the state.
+				if p.matchesMeta(state.Meta) {
+					state.TTL = -1
+
+					// In case an input is tried to be started with an unfinished state matching the glob pattern
+					if !state.Finished {
+						return fmt.Errorf("Can only start an input when all related states are finished: %+v", state)
+					}
+
+					// Update input states and send new states to registry
+					err := p.updateState(state)
+					if err != nil {
+						logp.Err("Problem putting initial state: %+v", err)
+						return err
+					}
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 	}
 
@@ -351,21 +379,6 @@ func (p *Input) getFiles() map[string]os.FileInfo {
 	return paths
 }
 
-// matchesFile returns true in case the given filePath is part of this input, means matches its glob patterns
-func (p *Input) matchesFile(filePath string, sources map[string]os.FileInfo) bool {
-	// Path is cleaned to ensure we always compare clean paths
-	filePath = filepath.Clean(filePath)
-
-	// Evaluate if filePath matches sources key
-	_, match := sources[filePath]
-
-	// Check if file is not excluded
-	if match && !p.isFileExcluded(filePath) {
-		return true
-	}
-	return false
-}
-
 // matchesMeta returns true in case the given meta is equal to the one of this input, false if not
 func (p *Input) matchesMeta(meta map[string]string) bool {
 	if len(meta) != len(p.meta) {
@@ -459,78 +472,67 @@ func getKeys(paths map[string]os.FileInfo) []string {
 
 // Scan starts a scanGlob for each provided path/glob
 func (p *Input) scan() {
-	var sortInfos []FileSortInfo
-	var files []string
+	matcher := NewGreatestFileMatcher(p.config.RootFs, p.config.Mounts)
+	for _, path := range p.config.Paths {
+		var err error
 
-	paths := p.getFiles()
-
-	var err error
-
-	if p.config.ScanSort != "" {
-		sortInfos, err = getSortedFiles(p.config.ScanOrder, p.config.ScanSort, getSortInfos(paths))
-		if err != nil {
-			logp.Err("Failed to sort files during scan due to error %s", err)
-		}
-	}
-
-	if sortInfos == nil {
-		files = getKeys(paths)
-	}
-
-	for i := 0; i < len(paths); i++ {
-
-		var path string
-		var info os.FileInfo
-
-		if sortInfos == nil {
-			path = files[i]
-			info = paths[path]
-		} else {
-			path = sortInfos[i].path
-			info = sortInfos[i].info
-		}
-
-		select {
-		case <-p.done:
-			logp.Info("Scan aborted because input stopped.")
-			return
-		default:
-		}
-
-		newState, err := getFileState(path, info, p)
-		if err != nil {
-			logp.Err("Skipping file %s due to error %s", path, err)
-		}
-
-		// Load last state
-		lastState := p.states.FindPrevious(newState)
-
-		// Ignores all files which fall under ignore_older
-		if p.isIgnoreOlder(newState) {
-			err := p.handleIgnoreOlder(lastState, newState)
-			if err != nil {
-				logp.Err("Updating ignore_older state error: %s", err)
+		err = matcher.GlobWithCallback(path, func(file string, fileInfo os.FileInfo) error {
+			// 文件超过过期时间则提前返回，避免加载无用的 state 对象导致内存消耗
+			modTime := fileInfo.ModTime()
+			if time.Since(modTime) > p.config.IgnoreOlder {
+				logp.Debug("input", "Ignore old file: %s, last modified: %v", file, modTime)
+				return nil
 			}
+
+			// check if the file is in the exclude_files list
+			if p.isFileExcluded(file) {
+				logp.Debug("input", "Exclude file: %s", file)
+				return nil
+			}
+
+			newState, err := getFileState(file, fileInfo, p)
+			if err != nil {
+				logp.Err("Skipping file %s due to error %s", path, err)
+			}
+
+			// Load last state
+			lastState := p.states.FindPrevious(newState)
+
+			// Ignores all files which fall under ignore_older
+			if p.isIgnoreOlder(newState) {
+				err := p.handleIgnoreOlder(lastState, newState)
+				if err != nil {
+					logp.Err("Updating ignore_older state error: %s", err)
+				}
+				return nil
+			}
+
+			// Decides if previous state exists
+			if lastState.IsEmpty() {
+				logp.Debug("input", "Start harvester for new file: %s, offset: %d", newState.Source, newState.Offset)
+				err := p.startHarvester(newState, 0)
+				if err == errHarvesterLimit {
+					logp.Debug("input", harvesterErrMsg, newState.Source, err)
+					return nil
+				}
+				if err != nil {
+					logp.Err(harvesterErrMsg, newState.Source, err)
+				}
+			} else {
+				p.harvestExistingFile(newState, lastState)
+			}
+
+			filesOffsetTotal.Add(lastState.Offset)
+			filesSizeTotal.Add(newState.Fileinfo.Size())
+
+			return nil
+		})
+
+		if err != nil {
+			logp.Err("glob(%s) failed: %v", path, err)
 			continue
 		}
 
-		// Decides if previous state exists
-		if lastState.IsEmpty() {
-			logp.Debug("input", "Start harvester for new file: %s, offset: %d", newState.Source, newState.Offset)
-			err := p.startHarvester(newState, 0)
-			if err == errHarvesterLimit {
-				logp.Debug("input", harvesterErrMsg, newState.Source, err)
-				continue
-			}
-			if err != nil {
-				logp.Err(harvesterErrMsg, newState.Source, err)
-			}
-		} else {
-			p.harvestExistingFile(newState, lastState)
-		}
-
-		filesOffsetTotal.Add(lastState.Offset)
-		filesSizeTotal.Add(newState.Fileinfo.Size())
 	}
 }
 
