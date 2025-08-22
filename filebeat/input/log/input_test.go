@@ -246,9 +246,18 @@ func TestGreatestFileMatcher(t *testing.T) {
 			panic(err)
 		}
 	}
+	// 创建符号链接 /tmp/test3/link_dir3/ -> /test2/host_space/ 如果有就不创建
+	if err := os.MkdirAll("/tmp/test3", 0755); err != nil {
+		panic(err)
+	}
+	if _, err := os.Lstat("/tmp/test3/link_dir3"); err != nil {
+		if err := os.Symlink("/tmp/test2/host_space/", "/tmp/test3/link_dir3"); err != nil {
+			panic(err)
+		}
+	}
 
 	// case 1.1: 基本测试
-	matcher := NewGreatestFileMatcher("", nil)
+	matcher := NewGreatestFileMatcher("/", nil)
 
 	matches, err := matcher.Glob("/tmp/test/*.txt")
 	if err != nil {
@@ -271,6 +280,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	assert.Equal(t, []string{}, matches)
 
 	// case 2.1.1: 基本软链测试
+	matcher = NewGreatestFileMatcher("/", nil)
 	matches, err = matcher.Glob("/tmp/test/link_dir/*.txt")
 	if err != nil {
 		panic(err)
@@ -283,7 +293,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.2: 见证奇迹的时候
-	matcher = NewGreatestFileMatcher("", []MountInfo{
+	matcher = NewGreatestFileMatcher("/", []MountInfo{
 		{
 			HostPath:      "/tmp/test2/host_space",
 			ContainerPath: "/cccc",
@@ -296,7 +306,7 @@ func TestGreatestFileMatcher(t *testing.T) {
 	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
 
 	// case 2.3: ...
-	matcher = NewGreatestFileMatcher("", []MountInfo{
+	matcher = NewGreatestFileMatcher("/", []MountInfo{
 		{
 			HostPath:      "/tmp/test2/host_space",
 			ContainerPath: "/cccc",
@@ -345,7 +355,43 @@ func TestGreatestFileMatcher(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("excepted: %v => actual: %v\n", []string{}, matches)
+	assert.Equal(t, []string{}, matches)
+
+	// case 3: 物理机场景
+	// case 3.1: 基本匹配
+	matcher = NewGreatestFileMatcher("", nil)
+
+	matches, err = matcher.Glob("/tmp/test/*.txt")
+	if err != nil {
+		panic(err)
+	}
+	assert.Equal(t, []string{"/tmp/test/file1.txt", "/tmp/test/file2.txt"}, matches)
+
+	// case 3.2: 多目录测试
+	matches, err = matcher.Glob("/tmp/test/*/*.txt")
+	if err != nil {
+		panic(err)
+	}
+	assert.Equal(t, []string{"/tmp/test/sub_dir/file3.txt"}, matches)
+
+	// case 3.3: 不存在测试
+	matches, err = matcher.Glob("/xxx/test/*/*.log")
+	if err != nil {
+		panic(err)
+	}
+	assert.Equal(t, []string{}, matches)
+
+	// case 3.4.1: 基本软链测试
+	matches, err = matcher.Glob("/tmp/test/link_dir/*.txt")
+	if err != nil {
+		panic(err)
+	}
+	assert.Equal(t, []string{}, matches)
+
+	// case 3.4.2: 指定根目录软链测试
+	matches, err = matcher.Glob("/tmp/test3/*/*.txt*")
+	assert.Equal(t, []string{"/tmp/test3/link_dir3/file4.txt"}, matches)
+
 }
 
 func TestInputFileExclude(t *testing.T) {

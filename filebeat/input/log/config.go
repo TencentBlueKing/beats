@@ -343,22 +343,32 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 		return nil
 	}
 
-	// 检查是否是符号链接，如果为根路径不做解析，避免循环记录
-	if fileInfo.Mode()&os.ModeSymlink != 0 && fullPath != currentPath.Fs {
-		// 获取链接指向的实际路径
-		link, err := os.Readlink(fullPath)
-		if err != nil {
-			logp.Debug("input", "[Glob func] Get link failed: %s", fullPath)
-			return err
+	if fileInfo.Mode()&os.ModeSymlink != 0 {
+		if currentPath.Fs == "" {
+			// 有一种特殊情况：如果 Fs 没有提供，则不解析符号链接，以兼容旧版本物理机软链展示逻辑 (仅展示软链而不是实际路径)
+			fileInfo, err = os.Stat(fullPath)
+			if err != nil {
+				logp.Debug("input", "[Glob func] Get file info [%s] failed: %s", fullPath, err)
+				return nil
+			}
+		} else if fullPath != currentPath.Fs {
+			// 检查是否是符号链接，如果为根路径不做解析，避免循环记录
+
+			// 获取链接指向的实际路径
+			link, err := os.Readlink(fullPath)
+			if err != nil {
+				logp.Debug("input", "[Glob func] Get link [%s] failed: %s", fullPath, err)
+				return nil
+			}
+			// 如果是软链，替换为软链指向的路径
+			if filepath.IsAbs(link) {
+				currentPath.Path = link
+			} else {
+				currentPath.Path = filepath.Join(filepath.Dir(currentPath.Path), link)
+			}
+			// 平级再次遍历
+			return m.walk(patterns, depth, currentPath, visited, nil, callback)
 		}
-		// 如果是软链，替换为软链指向的路径
-		if filepath.IsAbs(link) {
-			currentPath.Path = link
-		} else {
-			currentPath.Path = filepath.Join(filepath.Dir(currentPath.Path), link)
-		}
-		// 平级再次遍历
-		return m.walk(patterns, depth, currentPath, visited, nil, callback)
 	}
 
 	// 如果是目录，继续遍历
@@ -369,7 +379,8 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 		// 遍历目录
 		dirEntries, err := os.ReadDir(fullPath)
 		if err != nil {
-			return err
+			logp.Debug("input", "[Glob func] read dir [%s] failed: %s", fullPath, err)
+			return nil
 		}
 
 		anyMatch := false
@@ -377,7 +388,8 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 			// 匹配规则
 			matched, err := filepath.Match(pattern, dirEntry.Name())
 			if err != nil {
-				return err
+				logp.Debug("input", "[Glob func] match path [%s] with pattern [%s] failed: %s", dirEntry.Name(), pattern, err)
+				return nil
 			}
 			if !matched {
 				continue
@@ -409,7 +421,7 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 		return nil
 	}
 
-	return err
+	return nil
 }
 
 // selectFileSystem 根据路径前缀自动配置文件系统
