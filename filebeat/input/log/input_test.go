@@ -255,6 +255,15 @@ func TestGreatestFileMatcher(t *testing.T) {
 			panic(err)
 		}
 	}
+	// 创建符号链接 /tmp/test4/file.txt -> /tmp/test/file1.txt 如果有就不创建
+	if err := os.MkdirAll("/tmp/test4", 0755); err != nil {
+		panic(err)
+	}
+	if _, err := os.Lstat("/tmp/test4/file.txt"); err != nil {
+		if err := os.Symlink("/tmp/test/file1.txt", "/tmp/test4/file.txt"); err != nil {
+			panic(err)
+		}
+	}
 
 	// case 1.1: 基本测试
 	matcher := NewGreatestFileMatcher("/", nil)
@@ -291,6 +300,11 @@ func TestGreatestFileMatcher(t *testing.T) {
 	matcher = NewGreatestFileMatcher("/tmp", nil)
 	matches, err = matcher.Glob("/test/link_dir2/*.txt*")
 	assert.Equal(t, []string{"/tmp/test2/host_space/file4.txt"}, matches)
+
+	// case 2.1.3: 文件软链测试
+	matcher = NewGreatestFileMatcher("/tmp", nil)
+	matches, err = matcher.Glob("/test4/*.txt")
+	assert.Equal(t, []string{"/tmp/test4/file.txt"}, matches)
 
 	// case 2.2: 见证奇迹的时候
 	matcher = NewGreatestFileMatcher("/", []MountInfo{
@@ -392,6 +406,9 @@ func TestGreatestFileMatcher(t *testing.T) {
 	matches, err = matcher.Glob("/tmp/test3/*/*.txt*")
 	assert.Equal(t, []string{"/tmp/test3/link_dir3/file4.txt"}, matches)
 
+	// case 3.4.3: 文件软链测试
+	matches, err = matcher.Glob("/tmp/test4/*.txt")
+	assert.Equal(t, []string{"/tmp/test4/file.txt"}, matches)
 }
 
 func TestInputFileExclude(t *testing.T) {

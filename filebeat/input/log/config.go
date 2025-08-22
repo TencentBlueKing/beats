@@ -337,6 +337,14 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 	// 匹配深度超过 pattern 数量，说明已经匹配完毕
 	if depth >= len(patterns) {
 		logp.Debug("input", "[Glob func] Depth is : %v, File is dir: %s", depth, fullPath)
+		if fileInfo.Mode()&os.ModeSymlink != 0 {
+			// 如果是软链，先做解析，因为回调所给出的 fileInfo 必须是真实文件的信息，若是软链将导致无法启动采集
+			fileInfo, err = os.Stat(fullPath)
+			if err != nil {
+				logp.Debug("input", "[Glob func] Get file info [%s] failed: %s", fullPath, err)
+				return nil
+			}
+		}
 		if !fileInfo.IsDir() {
 			return callback(fullPath, fileInfo)
 		}
