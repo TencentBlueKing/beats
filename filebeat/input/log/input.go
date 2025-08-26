@@ -171,6 +171,8 @@ func (p *Input) loadStates(states []file.State) error {
 		statesBySource[state.Source] = append(statesBySource[state.Source], idx)
 	}
 
+	visited := map[string]struct{}{}
+
 	matcher := NewGreatestFileMatcher(p.config.RootFs, p.config.Mounts)
 	for _, path := range p.config.Paths {
 		var err error
@@ -186,6 +188,12 @@ func (p *Input) loadStates(states []file.State) error {
 				logp.Debug("input", "Exclude file: %s", file)
 				return nil
 			}
+
+			// 避免重复加载
+			if _, ok = visited[file]; ok {
+				return nil
+			}
+			visited[file] = struct{}{}
 
 			for _, idx := range indices {
 				state := states[idx]
@@ -399,6 +407,9 @@ func getKeys(paths map[string]os.FileInfo) []string {
 // Scan starts a scanGlob for each provided path/glob
 func (p *Input) scan() {
 	matcher := NewGreatestFileMatcher(p.config.RootFs, p.config.Mounts)
+
+	visited := map[string]struct{}{}
+
 	for _, path := range p.config.Paths {
 		var err error
 
@@ -419,6 +430,12 @@ func (p *Input) scan() {
 				logp.Debug("input", "Exclude file: %s", file)
 				return nil
 			}
+
+			// 避免重复加载
+			if _, ok := visited[file]; ok {
+				return nil
+			}
+			visited[file] = struct{}{}
 
 			filesScanMatchedTotal.Inc()
 
