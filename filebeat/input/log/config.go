@@ -284,7 +284,7 @@ type GreatestFileMatcher struct {
 // Glob 根据 pattern 匹配，并返回匹配的路径的列表
 func (m *GreatestFileMatcher) Glob(pattern string) ([]string, error) {
 	matches := make([]string, 0)
-	err := m.GlobWithCallback(pattern, func(path string) error {
+	err := m.GlobWithCallback(pattern, func(path string, fileInfo os.FileInfo) error {
 		matches = append(matches, path)
 		return nil
 	})
@@ -295,7 +295,7 @@ func (m *GreatestFileMatcher) Glob(pattern string) ([]string, error) {
 }
 
 // GlobWithCallback 根据 pattern 匹配，并将匹配的路径传给 callback 函数
-func (m *GreatestFileMatcher) GlobWithCallback(pattern string, callback func(string) error) error {
+func (m *GreatestFileMatcher) GlobWithCallback(pattern string, callback func(string, os.FileInfo) error) error {
 	// 已经访问过的文件
 	visited := map[string]struct{}{}
 	// 对 pattern 进行目录层级拆解
@@ -307,7 +307,7 @@ func (m *GreatestFileMatcher) GlobWithCallback(pattern string, callback func(str
 }
 
 // walk 遍历目录
-func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath FilePath, visited map[string]struct{}, fileInfo os.FileInfo, callback func(string) error) error {
+func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath FilePath, visited map[string]struct{}, fileInfo os.FileInfo, callback func(string, os.FileInfo) error) error {
 	var err error
 
 	// 切换到正确的文件系统
@@ -337,28 +337,46 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 	// 匹配深度超过 pattern 数量，说明已经匹配完毕
 	if depth >= len(patterns) {
 		logp.Debug("input", "[Glob func] Depth is : %v, File is dir: %s", depth, fullPath)
+		if fileInfo.Mode()&os.ModeSymlink != 0 {
+			// 如果是软链，先做解析，因为回调所给出的 fileInfo 必须是真实文件的信息，若是软链将导致无法启动采集
+			fileInfo, err = os.Stat(fullPath)
+			if err != nil {
+				logp.Debug("input", "[Glob func] Get file info [%s] failed: %s", fullPath, err)
+				return nil
+			}
+		}
 		if !fileInfo.IsDir() {
-			return callback(fullPath)
+			return callback(fullPath, fileInfo)
 		}
 		return nil
 	}
 
-	// 检查是否是符号链接，如果为根路径不做解析，避免循环记录
-	if fileInfo.Mode()&os.ModeSymlink != 0 && fullPath != currentPath.Fs {
-		// 获取链接指向的实际路径
-		link, err := os.Readlink(fullPath)
-		if err != nil {
-			logp.Debug("input", "[Glob func] Get link failed: %s", fullPath)
-			return err
+	if fileInfo.Mode()&os.ModeSymlink != 0 {
+		if currentPath.Fs == "" {
+			// 有一种特殊情况：如果 Fs 没有提供，则不解析符号链接，以兼容旧版本物理机软链展示逻辑 (仅展示软链而不是实际路径)
+			fileInfo, err = os.Stat(fullPath)
+			if err != nil {
+				logp.Debug("input", "[Glob func] Get file info [%s] failed: %s", fullPath, err)
+				return nil
+			}
+		} else if fullPath != currentPath.Fs {
+			// 检查是否是符号链接，如果为根路径不做解析，避免循环记录
+
+			// 获取链接指向的实际路径
+			link, err := os.Readlink(fullPath)
+			if err != nil {
+				logp.Debug("input", "[Glob func] Get link [%s] failed: %s", fullPath, err)
+				return nil
+			}
+			// 如果是软链，替换为软链指向的路径
+			if filepath.IsAbs(link) {
+				currentPath.Path = link
+			} else {
+				currentPath.Path = filepath.Join(filepath.Dir(currentPath.Path), link)
+			}
+			// 平级再次遍历
+			return m.walk(patterns, depth, currentPath, visited, nil, callback)
 		}
-		// 如果是软链，替换为软链指向的路径
-		if filepath.IsAbs(link) {
-			currentPath.Path = link
-		} else {
-			currentPath.Path = filepath.Join(filepath.Dir(currentPath.Path), link)
-		}
-		// 平级再次遍历
-		return m.walk(patterns, depth, currentPath, visited, nil, callback)
 	}
 
 	// 如果是目录，继续遍历
@@ -369,7 +387,8 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 		// 遍历目录
 		dirEntries, err := os.ReadDir(fullPath)
 		if err != nil {
-			return err
+			logp.Debug("input", "[Glob func] read dir [%s] failed: %s", fullPath, err)
+			return nil
 		}
 
 		anyMatch := false
@@ -377,7 +396,8 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 			// 匹配规则
 			matched, err := filepath.Match(pattern, dirEntry.Name())
 			if err != nil {
-				return err
+				logp.Debug("input", "[Glob func] match path [%s] with pattern [%s] failed: %s", dirEntry.Name(), pattern, err)
+				return nil
 			}
 			if !matched {
 				continue
@@ -409,7 +429,7 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 		return nil
 	}
 
-	return err
+	return nil
 }
 
 // selectFileSystem 根据路径前缀自动配置文件系统

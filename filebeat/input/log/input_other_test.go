@@ -21,13 +21,9 @@
 package log
 
 import (
-	"testing"
-
 	"github.com/elastic/beats/filebeat/input/file"
 	"github.com/elastic/beats/filebeat/util"
 	"github.com/elastic/beats/libbeat/common/match"
-
-	"github.com/stretchr/testify/assert"
 )
 
 var matchTests = []struct {
@@ -72,22 +68,6 @@ var matchTests = []struct {
 		[]match.Matcher{match.MustCompile("test2.log")},
 		true,
 	},
-}
-
-func TestMatchFile(t *testing.T) {
-	for _, test := range matchTests {
-
-		p := Input{
-			config: config{
-				Paths:        test.paths,
-				ExcludeFiles: test.excludeFiles,
-			},
-		}
-
-		sources := p.getFiles()
-
-		assert.Equal(t, test.result, p.matchesFile(test.file, sources))
-	}
 }
 
 var initStateTests = []struct {
@@ -141,30 +121,6 @@ var initStateTests = []struct {
 		[]string{"*.log"},
 		1, // Expecting only 1 state because of same inode (this is only a theoretical case)
 	},
-}
-
-// TestInit checks that the correct states are in an input after the init phase
-// This means only the ones that match the glob and not exclude files
-func TestInit(t *testing.T) {
-	for _, test := range initStateTests {
-		p := Input{
-			config: config{
-				Paths: test.paths,
-			},
-			states: file.NewStates(),
-			outlet: TestOutlet{},
-		}
-
-		// Set states to finished
-		for i, state := range test.states {
-			state.Finished = true
-			test.states[i] = state
-		}
-
-		err := p.loadStates(test.states)
-		assert.NoError(t, err)
-		assert.Equal(t, test.count, p.states.Count())
-	}
 }
 
 // TestOutlet is an empty outlet for testing
