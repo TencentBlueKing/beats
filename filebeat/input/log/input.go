@@ -191,6 +191,7 @@ func (p *Input) loadStates(states []file.State) error {
 
 			// 避免重复加载
 			if _, ok = visited[file]; ok {
+				logp.Debug("input", "skip visited file: %s", file)
 				return nil
 			}
 			visited[file] = struct{}{}
@@ -433,6 +434,7 @@ func (p *Input) scan() {
 
 			// 避免重复加载
 			if _, ok := visited[file]; ok {
+				logp.Debug("input", "skip visited file: %s", file)
 				return nil
 			}
 			visited[file] = struct{}{}
