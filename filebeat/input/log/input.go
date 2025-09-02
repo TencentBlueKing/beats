@@ -232,13 +232,7 @@ func (p *Input) Run() {
 
 	// TailFiles is like ignore_older = 1ns and only on startup
 	if p.config.TailFiles {
-		ignoreOlder := p.config.IgnoreOlder
-
-		// Overwrite ignore_older for the first scan
-		p.config.IgnoreOlder = 1
 		defer func() {
-			// Reset ignore_older after first run
-			p.config.IgnoreOlder = ignoreOlder
 			// Disable tail_files after the first run
 			p.config.TailFiles = false
 		}()
@@ -420,7 +414,7 @@ func (p *Input) scan() {
 			if p.config.IgnoreOlder > 0 {
 				// 文件超过过期时间则提前返回，避免加载无用的 state 对象导致内存消耗
 				modTime := fileInfo.ModTime()
-				if p.config.IgnoreOlder > 0 && time.Since(modTime) > p.config.IgnoreOlder {
+				if time.Since(modTime) > p.config.IgnoreOlder {
 					logp.Debug("input", "Ignore old file: %s, last modified: %v", file, modTime)
 					return nil
 				}
@@ -451,8 +445,13 @@ func (p *Input) scan() {
 
 			// Decides if previous state exists
 			if lastState.IsEmpty() {
-				logp.Debug("input", "Start harvester for new file: %s, offset: %d", newState.Source, newState.Offset)
-				err := p.startHarvester(newState, 0)
+				var offset int64 = 0
+				if p.config.TailFiles {
+					// 首次采集时，如果设置了 tail_files = true，则从文件末尾开始采集
+					offset = newState.Fileinfo.Size()
+				}
+				logp.Debug("input", "Start harvester for new file: %s, offset: %d", newState.Source, offset)
+				err := p.startHarvester(newState, offset)
 				if err == errHarvesterLimit {
 					logp.Debug("input", harvesterErrMsg, newState.Source, err)
 					return nil
