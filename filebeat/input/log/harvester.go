@@ -166,6 +166,7 @@ func (h *Harvester) Run() error {
 	h.stopLock.Unlock()
 	select {
 	case <-h.done:
+		h.reader.Stop()
 		h.stopWg.Done()
 		return nil
 	default:
