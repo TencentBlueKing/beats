@@ -53,7 +53,7 @@ This file is generated! See scripts/docs_collector.py
         # Load module fields.yml
         module_fields = ""
         with open(module_meta_path + "/fields.yml") as f:
-            module_fields = yaml.load(f.read())
+            module_fields = yaml.safe_load(f.read())
             module_fields = module_fields[0]
 
         title = module_fields["title"]
@@ -154,7 +154,7 @@ in <<configuration-metricbeat>>. Here is an example configuration:
             metricset_file += reference + "\n"
 
             with open(metricset_fields_path) as f:
-                metricset_fields = yaml.load(f.read())
+                metricset_fields = yaml.safe_load(f.read())
                 metricset_fields = metricset_fields[0]
 
             # Read local fields.yml

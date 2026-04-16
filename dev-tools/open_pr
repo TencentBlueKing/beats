@@ -45,9 +45,9 @@ def main():
     parser.add_argument("--yes", action="store_true",
                         help="Assume yes.")
     args = parser.parse_args()
-    local_branch = check_output("git rev-parse --abbrev-ref HEAD", shell=True).strip()
-    title = check_output("git show -q HEAD --format='%s'", shell=True).strip()
-    msg = check_output("git show -q HEAD --format='%b'", shell=True).strip()
+    local_branch = check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"]).strip()
+    title = check_output(["git", "show", "-q", "HEAD", "--format=%s"]).strip()
+    msg = check_output(["git", "show", "-q", "HEAD", "--format=%b"]).strip()
 
     labels = ["review"]
     if args.labels:
@@ -71,9 +71,7 @@ def main():
         return 1
 
     # push branch
-    check_call("git push --set-upstream {} {}"
-               .format(args.remote, local_branch), shell=True)
-
+    check_call(["git", "push", "--set-upstream", args.remote, local_branch])
 
     # open PR
     token = open(expanduser("~/.elastic/github.token"), "r").read().strip()
@@ -81,8 +79,7 @@ def main():
     session = requests.Session()
     session.headers.update({"Authorization": "token " + token})
 
-    remote_url = check_output("git remote get-url {}".format(args.remote),
-                              shell=True)
+    remote_url = check_output(["git", "remote", "get-url", args.remote])
     remote_user = re.search("github.com:(.+)/beats", remote_url).group(1)
 
     request = session.post(base + "/pulls", json=dict(
