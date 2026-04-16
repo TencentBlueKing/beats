@@ -336,6 +336,13 @@ func (fs *Fileset) getInputConfig() (*common.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Error expanding vars on the input path: %v", err)
 	}
+
+	// 安全检查：验证渲染后的路径是否在预期的fileset目录范围内，防止路径穿越
+	cleanPath := filepath.Clean(path)
+	if cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+		return nil, fmt.Errorf("Security: input path %q escapes fileset directory (path traversal detected)", path)
+	}
+
 	contents, err := ioutil.ReadFile(filepath.Join(fs.modulePath, fs.name, path))
 	if err != nil {
 		return nil, fmt.Errorf("Error reading input file %s: %v", path, err)
@@ -414,6 +421,12 @@ func (fs *Fileset) GetPipelines(esVersion common.Version) (pipelines []pipeline,
 		path, err := applyTemplate(fs.vars, ingestPipeline, false)
 		if err != nil {
 			return nil, fmt.Errorf("Error expanding vars on the ingest pipeline path: %v", err)
+		}
+
+		// 安全检查：验证渲染后的路径是否在预期的fileset目录范围内，防止路径穿越
+		cleanPath := filepath.Clean(path)
+		if cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+			return nil, fmt.Errorf("Security: ingest pipeline path %q escapes fileset directory (path traversal detected)", path)
 		}
 
 		strContents, err := ioutil.ReadFile(filepath.Join(fs.modulePath, fs.name, path))
