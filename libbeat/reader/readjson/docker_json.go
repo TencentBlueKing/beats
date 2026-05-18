@@ -163,7 +163,11 @@ func (p *DockerJSONReader) parseDockerJSONLog(message *reader.Message, msg *LogL
 	})
 	message.Content = []byte(msg.Log)
 	message.Ts = ts
-	msg.Partial = message.Content[len(message.Content)-1] != byte('\n')
+	if len(message.Content) == 0 {
+		msg.Partial = false
+	} else {
+		msg.Partial = message.Content[len(message.Content)-1] != byte('\n')
+	}
 
 	return nil
 }
@@ -249,7 +253,11 @@ func (p *DockerJSONReader) batchParseDockerJSONLog(content []byte, msg *LogLine)
 	}
 
 	content = []byte(msg.Log)
-	msg.Partial = content[len(content)-1] != byte('\n')
+	if len(content) == 0 {
+		msg.Partial = false
+	} else {
+		msg.Partial = content[len(content)-1] != byte('\n')
+	}
 
 	return content, nil
 }

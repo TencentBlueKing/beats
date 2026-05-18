@@ -60,6 +60,17 @@ func TestDockerJSON(t *testing.T) {
 			},
 		},
 		{
+			name:   "Empty log field does not panic",
+			input:  [][]byte{[]byte(`{"log":"","stream":"stdout","time":"2017-11-09T13:27:36.277747246Z"}`)},
+			stream: "all",
+			expectedMessage: reader.Message{
+				Content: []byte{},
+				Fields:  common.MapStr{"stream": "stdout"},
+				Ts:      time.Date(2017, 11, 9, 13, 27, 36, 277747246, time.UTC),
+				Bytes:   68,
+			},
+		},
+		{
 			name:          "Wrong CRI",
 			input:         [][]byte{[]byte(`2017-09-12T22:32:21.212861448Z stdout`)},
 			stream:        "all",
@@ -392,6 +403,20 @@ this is not JSON too
 				{
 					Content: []byte("1:M 09 Nov 13:27:36.276 # User requested shutdown...\n1:M 09 Nov 13:29:46.276 # User requested shutdown... too\n"),
 					Bytes:   287,
+				},
+			},
+		},
+		{
+			name: "Empty log field does not panic in batch mode",
+			input: [][]byte{
+				[]byte(`{"log":"","stream":"stdout","time":"2017-11-09T13:27:36.277747246Z"}
+{"log":"1:M 09 Nov 13:27:36.276 # ok\n","stream":"stdout","time":"2017-11-09T13:27:36.277747246Z"}`),
+			},
+			stream: "all",
+			expectedMessages: []reader.Message{
+				{
+					Content: []byte("1:M 09 Nov 13:27:36.276 # ok\n"),
+					Bytes:   167,
 				},
 			},
 		},
