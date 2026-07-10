@@ -20,6 +20,7 @@ package input
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mitchellh/hashstructure"
@@ -31,12 +32,53 @@ import (
 	"github.com/elastic/beats/libbeat/monitoring"
 )
 
+// AdaptiveScanIntervalFunc calculates the next scan interval from the runner
+// identity, configured base interval, and duration of the previous scan.
+// It can be called concurrently by multiple runners and must return quickly.
+type AdaptiveScanIntervalFunc func(inputID uint64, base, lastScan time.Duration) time.Duration
+
 var (
 	inputList = monitoring.NewUniqueList()
+
+	adaptiveScanInterval = struct {
+		sync.RWMutex
+		fn AdaptiveScanIntervalFunc
+	}{}
+	adaptiveScanRunnerSequence uint64
 )
 
 func init() {
 	monitoring.NewFunc(monitoring.GetNamespace("state").GetRegistry(), "input", inputList.Report, monitoring.Report)
+}
+
+// SetAdaptiveScanIntervalFunc replaces the process-wide adaptive scan interval
+// hook. Passing nil restores the configured scan frequency. The setter is not
+// a barrier: a callback copied by a runner before this call may still be in
+// flight, so callback-owned state must remain safe for concurrent access.
+func SetAdaptiveScanIntervalFunc(fn AdaptiveScanIntervalFunc) {
+	adaptiveScanInterval.Lock()
+	adaptiveScanInterval.fn = fn
+	adaptiveScanInterval.Unlock()
+}
+
+func nextScanInterval(inputID uint64, base, lastScan time.Duration) time.Duration {
+	adaptiveScanInterval.RLock()
+	fn := adaptiveScanInterval.fn
+	adaptiveScanInterval.RUnlock()
+
+	if fn == nil {
+		return base
+	}
+
+	interval := fn(inputID, base, lastScan)
+	if interval <= 0 {
+		return base
+	}
+	return interval
+}
+
+func nextAdaptiveScanRunnerID() uint64 {
+	return atomic.AddUint64(&adaptiveScanRunnerSequence, 1)
 }
 
 // Input is the interface common to all input
@@ -56,6 +98,8 @@ type Runner struct {
 	ID       uint64
 	Once     bool
 	beatDone chan struct{}
+
+	adaptiveScanID uint64
 }
 
 // New instantiates a new Runner
@@ -67,11 +111,12 @@ func New(
 	dynFields *common.MapStrPointer,
 ) (*Runner, error) {
 	input := &Runner{
-		config:   defaultConfig,
-		wg:       &sync.WaitGroup{},
-		done:     make(chan struct{}),
-		Once:     false,
-		beatDone: beatDone,
+		config:         defaultConfig,
+		wg:             &sync.WaitGroup{},
+		done:           make(chan struct{}),
+		Once:           false,
+		beatDone:       beatDone,
+		adaptiveScanID: nextAdaptiveScanRunnerID(),
 	}
 
 	var err error
@@ -137,7 +182,9 @@ func (p *Runner) Start() {
 // Run starts scanning through all the file paths and fetch the related files. Start a harvester for each file
 func (p *Runner) Run() {
 	// Initial input run
+	scanStarted := time.Now()
 	p.input.Run()
+	lastScan := time.Since(scanStarted)
 
 	// Shuts down after the first complete run of all input
 	if p.Once {
@@ -149,11 +196,31 @@ func (p *Runner) Run() {
 		case <-p.done:
 			logp.Info("input ticker stopped")
 			return
-		case <-time.After(p.config.ScanFrequency):
+		default:
+		}
+
+		interval := nextScanInterval(p.AdaptiveScanID(), p.config.ScanFrequency, lastScan)
+		select {
+		case <-p.done:
+			logp.Info("input ticker stopped")
+			return
+		case <-time.After(interval):
 			logp.Debug("input", "Run input")
+			scanStarted = time.Now()
 			p.input.Run()
+			lastScan = time.Since(scanStarted)
 		}
 	}
+}
+
+// AdaptiveScanID returns the process-unique identity used by adaptive scan
+// state. Unlike ID, it does not collide when equal configurations overlap
+// briefly during asynchronous reload.
+func (p *Runner) AdaptiveScanID() uint64 {
+	if p.adaptiveScanID != 0 {
+		return p.adaptiveScanID
+	}
+	return p.ID
 }
 
 // Reload reload the input for states
