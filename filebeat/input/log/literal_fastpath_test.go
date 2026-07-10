@@ -53,7 +53,7 @@ func TestHasMeta(t *testing.T) {
 	}
 }
 
-// TestLiteralFastPathEquivalence 关闭/开启 opt1，对同一批 pattern 结果必须字节级一致。
+// TestLiteralFastPathEquivalence 关闭/开启字面快路径，对同一批 pattern 结果必须字节级一致。
 // 覆盖：纯字面、末级通配、多级通配、缺失路径、大目录祖先、软链、挂载映射。
 func TestLiteralFastPathEquivalence(t *testing.T) {
 	base, err := os.MkdirTemp("", "literal-fastpath-eq-")
@@ -119,7 +119,7 @@ func TestLiteralFastPathEquivalence(t *testing.T) {
 			on, err = sortedGlob(matcher, pat)
 			require.NoError(t, err, "on pat=%s", pat)
 		})
-		assert.Equal(t, off, on, "opt1 must not change matches for %s", pat)
+		assert.Equal(t, off, on, "literal fast path must not change matches for %s", pat)
 	}
 
 	// mount: container virtual path -> host dir
@@ -140,7 +140,7 @@ func TestLiteralFastPathEquivalence(t *testing.T) {
 		onM, err = sortedGlob(mMatcher, mPat)
 		require.NoError(t, err)
 	})
-	assert.Equal(t, offM, onM, "opt1 must not change mount matches")
+	assert.Equal(t, offM, onM, "literal fast path must not change mount matches")
 	assert.Len(t, onM, 2)
 
 	// rootFs + symlink resolve (Fs != "")：pattern/软链目标均相对 rootFs
@@ -157,11 +157,11 @@ func TestLiteralFastPathEquivalence(t *testing.T) {
 		onR, err = sortedGlob(rootMatcher, rPat)
 		require.NoError(t, err)
 	})
-	assert.Equal(t, offR, onR, "opt1 must not change rootFs symlink matches")
+	assert.Equal(t, offR, onR, "literal fast path must not change rootFs symlink matches")
 	assert.Len(t, onR, 2)
 }
 
-// TestLiteralFastPathExistingSuite 确保开启 opt1 后既有 TestGreatestFileMatcher 场景仍成立。
+// TestLiteralFastPathKeepsPhysicalMatches 确保开启字面快路径后物理机场景匹配仍正确。
 // 直接复用同套 fixture 的关键断言路径（物理机 Fs==""）。
 func TestLiteralFastPathKeepsPhysicalMatches(t *testing.T) {
 	base := "/tmp/literal-fastpath-phys"
