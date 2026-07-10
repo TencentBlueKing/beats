@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -275,6 +276,10 @@ func (f *FilePath) GetFullPath() string {
 	return filepath.Join(f.Fs, f.Path)
 }
 
+// enableLiteralFastPath 控制字面路径分量是否跳过 ReadDir+Match（opt1）。
+// 默认开启；单测可通过临时关闭做与旧逻辑的结果对照。
+var enableLiteralFastPath = true
+
 // GreatestFileMatcher 地表最强支持多文件系统的文件匹配器
 type GreatestFileMatcher struct {
 	rootFs string
@@ -384,6 +389,19 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 		// 当前层级的匹配模式
 		pattern := patterns[depth]
 
+		// opt1: 纯字面(无通配符)层级无需 ReadDir 整个目录再逐条 Match，直接递归进拼接后的子路径。
+		// 挂载切换(selectFileSystem)与软链解析在子层级(下一次 walk)照常发生，映射语义不变；
+		// 这与下方"无匹配则直接拼字面名递归"的兜底路径等价，只是字面层级总是走，
+		// 避免对条目数很多的祖先目录每次扫描都做 O(条目数) 的枚举。
+		// enableLiteralFastPath 仅供单测 A/B 对照，生产默认 true。
+		if enableLiteralFastPath && !hasMeta(pattern) {
+			return m.walk(patterns, depth+1, FilePath{
+				Fs:       currentPath.Fs,
+				Path:     filepath.Join(currentPath.Path, pattern),
+				Switched: currentPath.Switched,
+			}, visited, nil, callback)
+		}
+
 		// 遍历目录
 		dirEntries, err := os.ReadDir(fullPath)
 		if err != nil {
@@ -430,6 +448,16 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 	}
 
 	return nil
+}
+
+// hasMeta 判断路径分量是否包含 glob 元字符，判定口径与 filepath.Match 保持一致
+// （* ? [ ，以及非 Windows 下的转义符 \）。纯字面分量可走 opt1 快路径，跳过目录枚举。
+func hasMeta(path string) bool {
+	magicChars := `*?[`
+	if runtime.GOOS != "windows" {
+		magicChars = `*?[\`
+	}
+	return strings.ContainsAny(path, magicChars)
 }
 
 // selectFileSystem 根据路径前缀自动配置文件系统
