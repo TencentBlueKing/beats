@@ -32,18 +32,21 @@ import (
 	"github.com/elastic/beats/libbeat/monitoring"
 )
 
-// AdaptiveScanIntervalFunc calculates the next scan interval from the runner
-// identity, configured base interval, and duration of the previous scan.
-// It can be called concurrently by multiple runners and must return quickly.
+// AdaptiveScanIntervalFunc 根据 Runner 实例标识、配置的基础扫描周期和上一轮扫描耗时，
+// 计算下一轮扫描周期。多个 Runner 会并发调用该函数，回调实现必须保证并发安全且快速返回。
 type AdaptiveScanIntervalFunc func(inputID uint64, base, lastScan time.Duration) time.Duration
 
 var (
 	inputList = monitoring.NewUniqueList()
 
+	// 锁只保护回调函数指针的替换和读取，回调本身在锁外执行，
+	// 避免慢回调长期阻塞配置更新，也避免回调内部更新钩子时发生死锁。
 	adaptiveScanInterval = struct {
 		sync.RWMutex
 		fn AdaptiveScanIntervalFunc
 	}{}
+	// 原 Runner.ID 是配置哈希，相同配置的新旧 Runner 在异步 Reload 时可能短暂重叠，
+	// 因此使用进程内唯一序号隔离两个实例的自适应状态。
 	adaptiveScanRunnerSequence uint64
 )
 
@@ -51,10 +54,9 @@ func init() {
 	monitoring.NewFunc(monitoring.GetNamespace("state").GetRegistry(), "input", inputList.Report, monitoring.Report)
 }
 
-// SetAdaptiveScanIntervalFunc replaces the process-wide adaptive scan interval
-// hook. Passing nil restores the configured scan frequency. The setter is not
-// a barrier: a callback copied by a runner before this call may still be in
-// flight, so callback-owned state must remain safe for concurrent access.
+// SetAdaptiveScanIntervalFunc 设置进程级动态扫描周期钩子，传入 nil 时恢复使用配置的扫描周期。
+// 该方法不是同步屏障：调用返回时，替换前已被 Runner 取出的旧回调仍可能正在执行，
+// 因此调用方必须保证回调持有的状态可被并发访问，且在旧回调退出前仍然有效。
 func SetAdaptiveScanIntervalFunc(fn AdaptiveScanIntervalFunc) {
 	adaptiveScanInterval.Lock()
 	adaptiveScanInterval.fn = fn
@@ -62,6 +64,7 @@ func SetAdaptiveScanIntervalFunc(fn AdaptiveScanIntervalFunc) {
 }
 
 func nextScanInterval(inputID uint64, base, lastScan time.Duration) time.Duration {
+	// 只在锁内复制函数指针，避免把扫描周期计算纳入全局临界区。
 	adaptiveScanInterval.RLock()
 	fn := adaptiveScanInterval.fn
 	adaptiveScanInterval.RUnlock()
@@ -71,6 +74,7 @@ func nextScanInterval(inputID uint64, base, lastScan time.Duration) time.Duratio
 	}
 
 	interval := fn(inputID, base, lastScan)
+	// 非正周期无法用于定时等待，统一回退到原配置，避免错误钩子影响既有采集行为。
 	if interval <= 0 {
 		return base
 	}
@@ -99,6 +103,7 @@ type Runner struct {
 	Once     bool
 	beatDone chan struct{}
 
+	// 仅用于关联进程内本次 Runner 生命周期对应的自适应状态。
 	adaptiveScanID uint64
 }
 
@@ -181,17 +186,18 @@ func (p *Runner) Start() {
 
 // Run starts scanning through all the file paths and fetch the related files. Start a harvester for each file
 func (p *Runner) Run() {
-	// Initial input run
+	// 启动后仍然立即执行首轮扫描，同时记录真实耗时，作为下一轮周期的计算依据。
 	scanStarted := time.Now()
 	p.input.Run()
 	lastScan := time.Since(scanStarted)
 
-	// Shuts down after the first complete run of all input
+	// Once 模式只执行首轮扫描，不需要计算一个永远不会使用的下一轮周期。
 	if p.Once {
 		return
 	}
 
 	for {
+		// 先检查停止信号，避免 Runner 已停止时仍调用一次外部周期计算回调。
 		select {
 		case <-p.done:
 			logp.Info("input ticker stopped")
@@ -199,6 +205,7 @@ func (p *Runner) Run() {
 		default:
 		}
 
+		// 每轮重新读取钩子，使运行中的 Runner 无需重建即可响应配置 Reload。
 		interval := nextScanInterval(p.AdaptiveScanID(), p.config.ScanFrequency, lastScan)
 		select {
 		case <-p.done:
@@ -213,9 +220,9 @@ func (p *Runner) Run() {
 	}
 }
 
-// AdaptiveScanID returns the process-unique identity used by adaptive scan
-// state. Unlike ID, it does not collide when equal configurations overlap
-// briefly during asynchronous reload.
+// AdaptiveScanID 返回自适应扫描状态使用的进程内唯一实例标识。
+// 它与基于配置哈希生成的 ID 分离，避免异步 Reload 期间相同配置的新旧 Runner 状态冲突。
+// 对测试或旧代码直接构造、尚未分配实例标识的 Runner，回退使用原 ID。
 func (p *Runner) AdaptiveScanID() uint64 {
 	if p.adaptiveScanID != 0 {
 		return p.adaptiveScanID

@@ -74,6 +74,8 @@ func TestAdaptiveScanRunnerIDsAreUnique(t *testing.T) {
 	assert.NotZero(t, second)
 }
 
+// controlledInput 通过 release 精确控制每轮 Run 的结束时机，
+// 用于验证传给回调的是各轮独立测量的真实耗时，而不是复用首轮结果。
 type controlledInput struct {
 	started chan struct{}
 	release chan struct{}
