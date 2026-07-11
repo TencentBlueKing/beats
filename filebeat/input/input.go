@@ -36,14 +36,24 @@ import (
 // 计算下一轮扫描周期。多个 Runner 会并发调用该函数，回调实现必须保证并发安全且快速返回。
 type AdaptiveScanIntervalFunc func(inputID uint64, base, lastScan time.Duration) time.Duration
 
+// AdaptiveScanAppliedFunc 接收 Beats 归一化后的最终扫描周期。
+// requested 是上层计算值，applied 是 Runner 实际用于等待的值；该回调同样必须并发安全且快速返回。
+type AdaptiveScanAppliedFunc func(inputID uint64, base, requested, applied, lastScan time.Duration)
+
+// AdaptiveScanHooks 将周期计算与最终结果通知绑定为同一代配置，避免 Reload 时新旧回调错配。
+type AdaptiveScanHooks struct {
+	Interval AdaptiveScanIntervalFunc
+	Applied  AdaptiveScanAppliedFunc
+}
+
 var (
 	inputList = monitoring.NewUniqueList()
 
-	// 锁只保护回调函数指针的替换和读取，回调本身在锁外执行，
+	// 锁只保护整组 hooks 的替换和读取，回调本身在锁外执行，
 	// 避免慢回调长期阻塞配置更新，也避免回调内部更新钩子时发生死锁。
-	adaptiveScanInterval = struct {
+	adaptiveScanHookSet = struct {
 		sync.RWMutex
-		fn AdaptiveScanIntervalFunc
+		hooks AdaptiveScanHooks
 	}{}
 	// 原 Runner.ID 是配置哈希，相同配置的新旧 Runner 在异步 Reload 时可能短暂重叠，
 	// 因此使用进程内唯一序号隔离两个实例的自适应状态。
@@ -54,34 +64,44 @@ func init() {
 	monitoring.NewFunc(monitoring.GetNamespace("state").GetRegistry(), "input", inputList.Report, monitoring.Report)
 }
 
-// SetAdaptiveScanIntervalFunc 设置进程级动态扫描周期钩子，传入 nil 时恢复使用配置的扫描周期。
+// SetAdaptiveScanHooks 原子替换进程级自适应扫描 hooks，传入零值时恢复使用配置的扫描周期。
 // 该方法不是同步屏障：调用返回时，替换前已被 Runner 取出的旧回调仍可能正在执行，
 // 因此调用方必须保证回调持有的状态可被并发访问，且在旧回调退出前仍然有效。
+func SetAdaptiveScanHooks(hooks AdaptiveScanHooks) {
+	adaptiveScanHookSet.Lock()
+	adaptiveScanHookSet.hooks = hooks
+	adaptiveScanHookSet.Unlock()
+}
+
+// SetAdaptiveScanIntervalFunc 兼容仅设置周期计算回调的调用方，不注册最终结果通知。
 func SetAdaptiveScanIntervalFunc(fn AdaptiveScanIntervalFunc) {
-	adaptiveScanInterval.Lock()
-	adaptiveScanInterval.fn = fn
-	adaptiveScanInterval.Unlock()
+	SetAdaptiveScanHooks(AdaptiveScanHooks{Interval: fn})
 }
 
 func nextScanInterval(inputID uint64, base, lastScan time.Duration) time.Duration {
-	// 只在锁内复制函数指针，避免把扫描周期计算纳入全局临界区。
-	adaptiveScanInterval.RLock()
-	fn := adaptiveScanInterval.fn
-	adaptiveScanInterval.RUnlock()
+	// 一次复制整组 hooks，确保本轮计算和通知始终来自同一代配置。
+	adaptiveScanHookSet.RLock()
+	hooks := adaptiveScanHookSet.hooks
+	adaptiveScanHookSet.RUnlock()
 
-	if fn == nil {
+	if hooks.Interval == nil {
 		return base
 	}
 
-	interval := fn(inputID, base, lastScan)
-	// 非正周期无法用于定时等待，统一回退到原配置，避免错误钩子影响既有采集行为。
-	if interval <= 0 {
-		return base
+	requested := hooks.Interval(inputID, base, lastScan)
+	applied := requested
+	// 非正周期或超过配置上限都回退到原配置，保证自适应扫描不会劣化既有扫描频率。
+	if requested <= 0 || requested > base {
+		applied = base
 	}
-	return interval
+	if hooks.Applied != nil {
+		hooks.Applied(inputID, base, requested, applied, lastScan)
+	}
+	return applied
 }
 
 func nextAdaptiveScanRunnerID() uint64 {
+	// uint64 零值即计数器初始值，首次 Add 返回 1，无需额外初始化。
 	return atomic.AddUint64(&adaptiveScanRunnerSequence, 1)
 }
 
@@ -207,6 +227,7 @@ func (p *Runner) Run() {
 
 		// 每轮重新读取钩子，使运行中的 Runner 无需重建即可响应配置 Reload。
 		interval := nextScanInterval(p.AdaptiveScanID(), p.config.ScanFrequency, lastScan)
+		// 前一个 select 只负责在计算前快速退出；这里负责在实际等待期间响应停止信号。
 		select {
 		case <-p.done:
 			logp.Info("input ticker stopped")

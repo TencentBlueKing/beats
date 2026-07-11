@@ -22,6 +22,7 @@ package input
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,15 +54,51 @@ func TestNextScanIntervalUsesHookContext(t *testing.T) {
 	assert.Equal(t, want, nextScanInterval(inputID, base, scanDuration))
 }
 
-func TestNextScanIntervalFallsBackForNonPositiveResult(t *testing.T) {
+func TestNextScanIntervalFallsBackForInvalidResult(t *testing.T) {
 	defer SetAdaptiveScanIntervalFunc(nil)
 
 	base := 10 * time.Second
-	for _, invalid := range []time.Duration{0, -time.Second} {
+	for _, invalid := range []time.Duration{0, -time.Second, 11 * time.Second} {
 		SetAdaptiveScanIntervalFunc(func(uint64, time.Duration, time.Duration) time.Duration {
 			return invalid
 		})
 		assert.Equal(t, base, nextScanInterval(1, base, time.Millisecond))
+	}
+}
+
+func TestNextScanIntervalReportsFinalAppliedInterval(t *testing.T) {
+	defer SetAdaptiveScanHooks(AdaptiveScanHooks{})
+
+	type appliedCall struct {
+		requested time.Duration
+		applied   time.Duration
+	}
+	calls := make(chan appliedCall, 4)
+	base := 10 * time.Second
+	requestedIntervals := []time.Duration{500 * time.Millisecond, 0, -time.Second, 11 * time.Second}
+
+	for _, requested := range requestedIntervals {
+		SetAdaptiveScanHooks(AdaptiveScanHooks{
+			Interval: func(uint64, time.Duration, time.Duration) time.Duration {
+				return requested
+			},
+			Applied: func(_ uint64, gotBase, gotRequested, gotApplied, gotLastScan time.Duration) {
+				assert.Equal(t, base, gotBase)
+				assert.Equal(t, time.Millisecond, gotLastScan)
+				calls <- appliedCall{requested: gotRequested, applied: gotApplied}
+			},
+		})
+
+		got := nextScanInterval(1, base, time.Millisecond)
+		call := <-calls
+		assert.Equal(t, requested, call.requested)
+		if requested <= 0 || requested > base {
+			assert.Equal(t, base, got)
+			assert.Equal(t, base, call.applied)
+		} else {
+			assert.Equal(t, requested, got)
+			assert.Equal(t, requested, call.applied)
+		}
 	}
 }
 
@@ -222,20 +259,31 @@ func TestRunnerDoesNotCallAdaptiveIntervalHookWhenStoppedAfterScan(t *testing.T)
 }
 
 func TestAdaptiveScanIntervalFuncCanBeReplacedConcurrently(t *testing.T) {
-	defer SetAdaptiveScanIntervalFunc(nil)
+	defer SetAdaptiveScanHooks(AdaptiveScanHooks{})
 
+	var mismatches int32
+	hooks := func(expected time.Duration) AdaptiveScanHooks {
+		return AdaptiveScanHooks{
+			Interval: func(uint64, time.Duration, time.Duration) time.Duration {
+				return expected
+			},
+			Applied: func(_ uint64, _ time.Duration, requested, applied, _ time.Duration) {
+				if requested != expected || applied != expected {
+					atomic.AddInt32(&mismatches, 1)
+				}
+			},
+		}
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		wg.Add(2)
 		go func(i int) {
 			defer wg.Done()
 			if i%2 == 0 {
-				SetAdaptiveScanIntervalFunc(nil)
+				SetAdaptiveScanHooks(hooks(time.Millisecond))
 				return
 			}
-			SetAdaptiveScanIntervalFunc(func(_ uint64, base, _ time.Duration) time.Duration {
-				return base
-			})
+			SetAdaptiveScanHooks(hooks(2 * time.Millisecond))
 		}(i)
 		go func() {
 			defer wg.Done()
@@ -243,4 +291,5 @@ func TestAdaptiveScanIntervalFuncCanBeReplacedConcurrently(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	assert.Equal(t, int32(0), atomic.LoadInt32(&mismatches))
 }
