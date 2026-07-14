@@ -33,7 +33,7 @@ func TestNextScanIntervalDefaultsToBase(t *testing.T) {
 	SetAdaptiveScanIntervalFunc(nil)
 
 	base := 10 * time.Second
-	assert.Equal(t, base, nextScanInterval(1, base, time.Millisecond))
+	assert.Equal(t, base, nextScanInterval("log", 1, base, time.Millisecond))
 }
 
 func TestNextScanIntervalUsesHookContext(t *testing.T) {
@@ -51,7 +51,7 @@ func TestNextScanIntervalUsesHookContext(t *testing.T) {
 		return want
 	})
 
-	assert.Equal(t, want, nextScanInterval(inputID, base, scanDuration))
+	assert.Equal(t, want, nextScanInterval("log", inputID, base, scanDuration))
 }
 
 func TestNextScanIntervalFallsBackForInvalidResult(t *testing.T) {
@@ -62,7 +62,7 @@ func TestNextScanIntervalFallsBackForInvalidResult(t *testing.T) {
 		SetAdaptiveScanIntervalFunc(func(uint64, time.Duration, time.Duration) time.Duration {
 			return invalid
 		})
-		assert.Equal(t, base, nextScanInterval(1, base, time.Millisecond))
+		assert.Equal(t, base, nextScanInterval("log", 1, base, time.Millisecond))
 	}
 }
 
@@ -89,7 +89,7 @@ func TestNextScanIntervalReportsFinalAppliedInterval(t *testing.T) {
 			},
 		})
 
-		got := nextScanInterval(1, base, time.Millisecond)
+		got := nextScanInterval("log", 1, base, time.Millisecond)
 		call := <-calls
 		assert.Equal(t, requested, call.requested)
 		if requested <= 0 || requested > base {
@@ -148,7 +148,7 @@ func TestRunnerUsesMeasuredScanDurationForNextInterval(t *testing.T) {
 		release: make(chan struct{}, 2),
 	}
 	runner := &Runner{
-		config:         inputConfig{ScanFrequency: base},
+		config:         inputConfig{Type: "log", ScanFrequency: base},
 		input:          input,
 		done:           make(chan struct{}),
 		ID:             7,
@@ -209,6 +209,36 @@ func (*immediateInput) Run()    {}
 func (*immediateInput) Stop()   {}
 func (*immediateInput) Wait()   {}
 
+func TestNextScanIntervalOnlyAppliesHooksToFileScanningInputs(t *testing.T) {
+	defer SetAdaptiveScanHooks(AdaptiveScanHooks{})
+
+	base := 10 * time.Second
+	want := time.Second
+	intervalCalls := 0
+	appliedCalls := 0
+	SetAdaptiveScanHooks(AdaptiveScanHooks{
+		Interval: func(uint64, time.Duration, time.Duration) time.Duration {
+			intervalCalls++
+			return want
+		},
+		Applied: func(uint64, time.Duration, time.Duration, time.Duration, time.Duration) {
+			appliedCalls++
+		},
+	})
+
+	for _, inputType := range []string{"log", "docker"} {
+		assert.Equal(t, want, nextScanInterval(inputType, 1, base, time.Millisecond), inputType)
+	}
+	assert.Equal(t, 2, intervalCalls)
+	assert.Equal(t, 2, appliedCalls)
+
+	for _, inputType := range []string{"redis", "winlog", "kafka", "syslog", "tcp", "udp", "stdin"} {
+		assert.Equal(t, base, nextScanInterval(inputType, 1, base, time.Millisecond), inputType)
+	}
+	assert.Equal(t, 2, intervalCalls)
+	assert.Equal(t, 2, appliedCalls)
+}
+
 func TestRunnerOnceDoesNotCallAdaptiveIntervalHook(t *testing.T) {
 	defer SetAdaptiveScanIntervalFunc(nil)
 
@@ -219,7 +249,7 @@ func TestRunnerOnceDoesNotCallAdaptiveIntervalHook(t *testing.T) {
 	})
 
 	runner := &Runner{
-		config: inputConfig{ScanFrequency: time.Hour},
+		config: inputConfig{Type: "log", ScanFrequency: time.Hour},
 		input:  &immediateInput{},
 		done:   make(chan struct{}),
 		Once:   true,
@@ -245,7 +275,7 @@ func TestRunnerDoesNotCallAdaptiveIntervalHookWhenStoppedAfterScan(t *testing.T)
 	done := make(chan struct{})
 	close(done)
 	runner := &Runner{
-		config: inputConfig{ScanFrequency: time.Hour},
+		config: inputConfig{Type: "log", ScanFrequency: time.Hour},
 		input:  &immediateInput{},
 		done:   done,
 	}
@@ -287,7 +317,7 @@ func TestAdaptiveScanIntervalFuncCanBeReplacedConcurrently(t *testing.T) {
 		}(i)
 		go func() {
 			defer wg.Done()
-			assert.True(t, nextScanInterval(1, time.Second, time.Millisecond) > 0)
+			assert.True(t, nextScanInterval("log", 1, time.Second, time.Millisecond) > 0)
 		}()
 	}
 	wg.Wait()

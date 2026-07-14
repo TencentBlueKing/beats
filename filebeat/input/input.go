@@ -26,6 +26,7 @@ import (
 	"github.com/mitchellh/hashstructure"
 
 	"github.com/elastic/beats/filebeat/channel"
+	filebeatconfig "github.com/elastic/beats/filebeat/config"
 	"github.com/elastic/beats/filebeat/input/file"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
@@ -78,7 +79,13 @@ func SetAdaptiveScanIntervalFunc(fn AdaptiveScanIntervalFunc) {
 	SetAdaptiveScanHooks(AdaptiveScanHooks{Interval: fn})
 }
 
-func nextScanInterval(inputID uint64, base, lastScan time.Duration) time.Duration {
+func nextScanInterval(inputType string, inputID uint64, base, lastScan time.Duration) time.Duration {
+	// log 与 docker 都会在 Run 中重复扫描文件路径；其他 input 的 Run 可能包含连接、
+	// 重置或一次性启动语义，必须维持原调用周期，也不能把耗时计入文件扫描 governor。
+	if inputType != filebeatconfig.DefaultType && inputType != "docker" {
+		return base
+	}
+
 	// 一次复制整组 hooks，确保本轮计算和通知始终来自同一代配置。
 	adaptiveScanHookSet.RLock()
 	hooks := adaptiveScanHookSet.hooks
@@ -226,7 +233,7 @@ func (p *Runner) Run() {
 		}
 
 		// 每轮重新读取钩子，使运行中的 Runner 无需重建即可响应配置 Reload。
-		interval := nextScanInterval(p.AdaptiveScanID(), p.config.ScanFrequency, lastScan)
+		interval := nextScanInterval(p.config.Type, p.AdaptiveScanID(), p.config.ScanFrequency, lastScan)
 		// 前一个 select 只负责在计算前快速退出；这里负责在实际等待期间响应停止信号。
 		select {
 		case <-p.done:
