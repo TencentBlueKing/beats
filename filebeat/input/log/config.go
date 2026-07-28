@@ -89,7 +89,7 @@ type MountInfo struct {
 type FilePath struct {
 	Fs   string
 	Path string
-	// Switched 是否已经切换过文件系统，最多只能切换一次
+	// Switched 当前路径解析段是否已经切换过文件系统
 	Switched bool
 }
 
@@ -375,7 +375,11 @@ func (m *GreatestFileMatcher) walk(patterns []string, depth int, currentPath Fil
 			}
 			// 如果是软链，替换为软链指向的路径
 			if filepath.IsAbs(link) {
-				currentPath.Path = link
+				// 绝对软链目标使用容器内路径，需回到容器根文件系统重新解析。
+				// 同时重置切换状态，允许目标路径命中另一个容器挂载。
+				currentPath.Fs = m.rootFs
+				currentPath.Path = filepath.Clean(link)
+				currentPath.Switched = false
 			} else {
 				currentPath.Path = filepath.Join(filepath.Dir(currentPath.Path), link)
 			}
