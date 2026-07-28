@@ -13,32 +13,32 @@ func TestGreatestFileMatcherAbsoluteSymlinkAcrossMounts(t *testing.T) {
 	baseDir := t.TempDir()
 	rootFs := filepath.Join(baseDir, "rootfs")
 	logMount := filepath.Join(baseDir, "log-mount")
-	mntMount := filepath.Join(baseDir, "mnt-mount")
-	targetDir := filepath.Join(mntMount, "lobby-17848742680-25swr")
-	targetFile := filepath.Join(targetDir, "framework.log.1")
+	runtimeMount := filepath.Join(baseDir, "runtime-mount")
+	targetDir := filepath.Join(runtimeMount, "instance-a")
+	targetFile := filepath.Join(targetDir, "service.log.1")
 
-	require.NoError(t, os.MkdirAll(filepath.Join(rootFs, "data/home/user00"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(rootFs, "workload"), 0o755))
 	require.NoError(t, os.MkdirAll(logMount, 0o755))
 	require.NoError(t, os.MkdirAll(targetDir, 0o755))
 	require.NoError(t, os.WriteFile(targetFile, []byte("log"), 0o644))
 	require.NoError(t, os.Symlink(
-		"/data/home/user00/mnt/lobby-17848742680-25swr",
-		filepath.Join(logMount, "lobby"),
+		"/workload/runtime/instance-a",
+		filepath.Join(logMount, "current"),
 	))
 
 	matcher := NewGreatestFileMatcher(rootFs, []MountInfo{
 		{
 			HostPath:      logMount,
-			ContainerPath: "/data/home/user00/log",
+			ContainerPath: "/workload/logs",
 		},
 		{
-			HostPath:      mntMount,
-			ContainerPath: "/data/home/user00/mnt",
+			HostPath:      runtimeMount,
+			ContainerPath: "/workload/runtime",
 		},
 	})
 
 	inputConfig := config{
-		Paths:         []string{"/data/home/user00/log/**/framework.log.*"},
+		Paths:         []string{"/workload/logs/**/service.log.*"},
 		RecursiveGlob: true,
 	}
 	require.NoError(t, inputConfig.resolveRecursiveGlobs())
