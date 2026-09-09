@@ -411,6 +411,49 @@ func TestGreatestFileMatcher(t *testing.T) {
 	assert.Equal(t, []string{"/tmp/test4/file.txt"}, matches)
 }
 
+// TestGreatestFileMatcherSymlinkCrossVolume 回归用例：采集路径为软链、且软链目标穿越卷边界
+// (容器 rootfs 内软链 -> 卷/PVC 内目录) 时，在 sidecar 下发全量 mounts 的前提下，采集器应能
+// Readlink 解析软链、按 container_path 命中卷挂载并采集到卷内文件。
+// 对应 bklog-sidecar "采集路径为软链时 mounts 为空、卷内日志采集不到" 缺陷
+// (TencentBlueKing/bkmonitor-datalink#1352)。与 TestGreatestFileMatcher case 2.2 同构，
+// 这里用贴近真实的 apphome -> PVC 命名并自包含 (t.TempDir) 以作独立护栏。
+func TestGreatestFileMatcherSymlinkCrossVolume(t *testing.T) {
+	rootFs := t.TempDir()  // 模拟容器 overlay rootfs 在宿主机上的路径
+	hostVol := t.TempDir() // 模拟宿主机上的卷(PVC)目录
+
+	// 容器视角的卷挂载：container_path=/data/release 实际落在宿主机 hostVol
+	containerPath := "/data/release"
+
+	// 卷内真实日志：<hostVol>/qsshome/app/run.log
+	logDir := filepath.Join(hostVol, "qsshome", "app")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	logFile := filepath.Join(logDir, "run.log")
+	if err := os.WriteFile(logFile, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 容器 rootfs 内软链：<rootFs>/data/apphome -> /data/release/qsshome (容器视角绝对路径，
+	// 目标穿越到卷内，故宿主机上是悬空软链，符合真实 overlay 场景)
+	appParent := filepath.Join(rootFs, "data")
+	if err := os.MkdirAll(appParent, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/data/release/qsshome", filepath.Join(appParent, "apphome")); err != nil {
+		t.Fatal(err)
+	}
+
+	matcher := NewGreatestFileMatcher(rootFs, []MountInfo{
+		{HostPath: hostVol, ContainerPath: containerPath},
+	})
+	matches, err := matcher.Glob("/data/apphome/*/run.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, []string{logFile}, matches)
+}
+
 func TestInputFileExclude(t *testing.T) {
 	p := Input{
 		config: config{
