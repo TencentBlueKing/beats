@@ -159,44 +159,81 @@ func NewInput(
 	return p, nil
 }
 
+// stateIdentifier returns the key used to match a registry state against a file found by the
+// current scan. The key follows config.FileIdentifier so that it stays consistent with the
+// identifier used everywhere else (States.idx, FindPrevious, registrar).
+//
+// state.ID() must not be used here: State.FileIdentifier is tagged json:"-" and is therefore
+// always empty after being read back from the registry, which makes ID() fall through to the
+// inode branch even when path or inode_path is configured.
+//
+// Meta is deliberately left out of the key, matchesMeta already handles it below.
+func (p *Input) stateIdentifier(state file.State) string {
+	switch p.config.FileIdentifier {
+	case file.IdentifierPath:
+		return state.Source
+	case file.IdentifierInodePath:
+		return state.FileStateOS.String() + ":" + state.Source
+	default: // file.IdentifierInode
+		return state.FileStateOS.String()
+	}
+}
+
 // LoadStates loads states into input
 // It goes through all states coming from the registry. Only the states which match the glob patterns of
 // the input will be loaded and updated. All other states will not be touched.
 func (p *Input) loadStates(states []file.State) error {
 	logp.Debug("input", "exclude_files: %s. Number of stats: %d", p.config.ExcludeFiles, len(states))
 
-	// 先将 state 按照 source 分组，value 为下标列表，方便后续查找
-	statesBySource := make(map[string][]int)
+	// 按文件唯一标识分组，value 为下标列表，方便后续查找。
+	//
+	// 这里不能按 state.Source（完整路径）分组：容器采集的路径由 sidecar 下发的 root_fs / mounts
+	// 换算而来，两者都绑定容器实例的生命周期——root_fs 是 /proc/<pid>/root；mounts 里凡是用了
+	// subPath / subPathExpr 的挂载点，kubelet 必须为该子目录单独做一层 bind mount，上报的挂载源
+	// 是 kubelet 根目录下的 pods/<pod-uid>/volume-subpaths/<volume>/<container>/<n>，即便卷本身
+	// 是路径固定的 hostPath 也一样。Pod 一重建，同一个物理文件的路径就变了，按路径认领必然失配，
+	// registry 里的 offset 被整份丢弃，宿主机上积累的历史日志会从 0 重采一遍。
+	statesByID := make(map[string][]int)
 	for idx, state := range states {
-		statesBySource[state.Source] = append(statesBySource[state.Source], idx)
+		id := p.stateIdentifier(state)
+		statesByID[id] = append(statesByID[id], idx)
 	}
 
 	visited := map[string]struct{}{}
+	// 同一个 state 只认领一次。inode 口径下 bind mount / 硬链接会让多条路径映射到同一条 state，
+	// 若两条路径在同一轮扫描里都命中，认领两次只会让最后一条路径覆盖前一条，结果不确定。
+	claimed := map[int]struct{}{}
 
 	matcher := NewGreatestFileMatcher(p.config.RootFs, p.config.Mounts)
 	for _, path := range p.config.Paths {
 		var err error
 
-		err = matcher.GlobWithCallback(path, func(file string, fileInfo os.FileInfo) error {
-			indices, ok := statesBySource[file]
+		err = matcher.GlobWithCallback(path, func(filePath string, fileInfo os.FileInfo) error {
+			// 用本轮扫描到的文件算出同一个键，保证与 registry 侧口径一致
+			scanned := file.NewState(fileInfo, filePath, p.config.Type, p.meta, p.config.FileIdentifier)
+			indices, ok := statesByID[p.stateIdentifier(scanned)]
 			if !ok {
 				return nil
 			}
 
 			// check if the file is in the exclude_files list
-			if p.isFileExcluded(file) {
-				logp.Debug("input", "Exclude file: %s", file)
+			if p.isFileExcluded(filePath) {
+				logp.Debug("input", "Exclude file: %s", filePath)
 				return nil
 			}
 
 			// 避免重复加载
-			if _, ok = visited[file]; ok {
-				logp.Debug("input", "skip visited file: %s", file)
+			if _, ok = visited[filePath]; ok {
+				logp.Debug("input", "skip visited file: %s", filePath)
 				return nil
 			}
-			visited[file] = struct{}{}
+			visited[filePath] = struct{}{}
 
 			for _, idx := range indices {
+				if _, done := claimed[idx]; done {
+					continue
+				}
+
 				state := states[idx]
 				// Check if state source belongs to this input. If yes, update the state.
 				if p.matchesMeta(state.Meta) {
@@ -207,12 +244,29 @@ func (p *Input) loadStates(states []file.State) error {
 						return fmt.Errorf("Can only start an input when all related states are finished: %+v", state)
 					}
 
+					// The registry holds the path seen by the previous run. Now that the state is
+					// matched by file identity rather than by path, the three fields that are either
+					// stale or absent after deserialization have to be refreshed:
+					//
+					//   Source         stale path would make CleanRemoved os.Stat a path that no longer
+					//                  exists, drop the state as removed and re-read the file from 0
+					//   Fileinfo       nil after deserialization, isCleanInactive would panic on ModTime
+					//   FileIdentifier tagged json:"-", without it ID() falls back to inode and the key
+					//                  in p.states no longer matches FindPrevious during scan
+					//
+					// Id is reset so that ID() recomputes it from the refreshed fields.
+					state.Source = filePath
+					state.Fileinfo = fileInfo
+					state.FileIdentifier = p.config.FileIdentifier
+					state.Id = ""
+
 					// Update input states and send new states to registry
 					err := p.updateState(state)
 					if err != nil {
 						logp.Err("Problem putting initial state: %+v", err)
 						return err
 					}
+					claimed[idx] = struct{}{}
 				}
 			}
 			return nil

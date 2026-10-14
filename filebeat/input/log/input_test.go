@@ -422,24 +422,28 @@ func TestInputFileExclude(t *testing.T) {
 	assert.False(t, p.isFileExcluded("/tmp/log/logw.log"))
 }
 
+// inactiveFor is stored as a duration rather than an absolute time on purpose: this table is a
+// package level var and would be evaluated during package initialisation, while the suite takes
+// over two minutes to reach this test. An absolute "5 seconds ago" is far older than that by the
+// time it is asserted, which made the 10s case fail.
 var cleanInactiveTests = []struct {
 	cleanInactive time.Duration
-	fileTime      time.Time
+	inactiveFor   time.Duration
 	result        bool
 }{
 	{
 		cleanInactive: 0,
-		fileTime:      time.Now(),
+		inactiveFor:   0,
 		result:        false,
 	},
 	{
 		cleanInactive: 1 * time.Second,
-		fileTime:      time.Now().Add(-5 * time.Second),
+		inactiveFor:   5 * time.Second,
 		result:        true,
 	},
 	{
 		cleanInactive: 10 * time.Second,
-		fileTime:      time.Now().Add(-5 * time.Second),
+		inactiveFor:   5 * time.Second,
 		result:        false,
 	},
 }
@@ -454,7 +458,7 @@ func TestIsCleanInactive(t *testing.T) {
 		}
 		state := file.State{
 			Fileinfo: TestFileInfo{
-				time: test.fileTime,
+				time: time.Now().Add(-test.inactiveFor),
 			},
 		}
 
