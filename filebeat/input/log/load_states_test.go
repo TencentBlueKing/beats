@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -112,8 +113,11 @@ func TestLoadStatesClaimsStateAcrossPathChange(t *testing.T) {
 
 	oldPath, newPath, info := linkedPaths(t, "some already collected content")
 	p, outlet := newLoadStatesInput(t, file.IdentifierInode, newPath, nil)
+	state := registryState(oldPath, info, offset, nil)
+	graceUntil := time.Now().Add(time.Hour)
+	state.GraceUntil = &graceUntil
 
-	require.NoError(t, p.loadStates([]file.State{registryState(oldPath, info, offset, nil)}))
+	require.NoError(t, p.loadStates([]file.State{state}))
 
 	states := p.states.GetStates()
 	require.Len(t, states, 1, "the state must be claimed through the new path")
@@ -121,9 +125,11 @@ func TestLoadStatesClaimsStateAcrossPathChange(t *testing.T) {
 	assert.Equal(t, newPath, states[0].Source, "Source must be refreshed, otherwise CleanRemoved drops the state")
 	assert.Equal(t, file.IdentifierInode, states[0].FileIdentifier)
 	assert.NotNil(t, states[0].Fileinfo, "Fileinfo must be refreshed, isCleanInactive reads ModTime")
+	assert.Nil(t, states[0].GraceUntil, "claiming the state must cancel pending grace cleanup")
 
 	require.Len(t, outlet.states, 1, "the refreshed state must also be pushed to the registry")
 	assert.Equal(t, newPath, outlet.states[0].Source)
+	assert.Nil(t, outlet.states[0].GraceUntil)
 }
 
 // TestLoadStatesFindPreviousAfterPathChange covers the second half of the fix: the claimed

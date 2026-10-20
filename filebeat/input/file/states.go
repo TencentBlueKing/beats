@@ -104,10 +104,12 @@ func (s *States) Cleanup() (int, int) {
 	L := len(s.states)
 	for i := 0; i < L; {
 		state := &s.states[i]
-		canExpire := state.TTL > 0
-		expired := (canExpire && currentTime.Sub(state.Timestamp) > state.TTL)
+		ttlCanExpire := state.TTL > 0
+		canExpire := ttlCanExpire || state.GraceUntil != nil
+		expired := ttlCanExpire && currentTime.Sub(state.Timestamp) > state.TTL
+		graceExpired := state.GraceUntil != nil && !currentTime.Before(*state.GraceUntil)
 
-		if state.TTL == 0 || expired {
+		if state.TTL == 0 || expired || graceExpired {
 			if !state.Finished {
 				logp.Err("State for %s should have been dropped, but couldn't as state is not finished.", state.Source)
 				i++
@@ -115,7 +117,7 @@ func (s *States) Cleanup() (int, int) {
 			}
 
 			delete(s.idx, state.ID())
-			logp.Debug("state", "State removed for %v because of older: %v", state.Source, state.TTL)
+			logp.Debug("state", "State removed for %v because of ttl: %v, grace_until: %v", state.Source, state.TTL, state.GraceUntil)
 
 			L--
 			if L != i {

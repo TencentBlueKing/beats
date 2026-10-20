@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//go:build !integration
 // +build !integration
 
 package file
@@ -81,6 +82,70 @@ func TestCleanup(t *testing.T) {
 
 			assert.Equal(t, test.countBefore, states.Count())
 			cleanupCount, _ := states.Cleanup()
+			assert.Equal(t, test.cleanupCount, cleanupCount)
+			assert.Equal(t, test.countAfter, states.Count())
+		})
+	}
+}
+
+func TestCleanupGraceUntil(t *testing.T) {
+	future := time.Now().Add(time.Hour)
+	expired := time.Now().Add(-time.Hour)
+
+	tests := []struct {
+		name         string
+		state        State
+		cleanupCount int
+		countAfter   int
+	}{
+		{
+			name: "future grace retains unmanaged finished state",
+			state: State{
+				TTL:        -2,
+				Finished:   true,
+				GraceUntil: &future,
+			},
+			cleanupCount: 0,
+			countAfter:   1,
+		},
+		{
+			name: "expired grace removes finished state",
+			state: State{
+				TTL:        -2,
+				Finished:   true,
+				GraceUntil: &expired,
+			},
+			cleanupCount: 1,
+			countAfter:   0,
+		},
+		{
+			name: "expired grace retains unfinished state",
+			state: State{
+				TTL:        -2,
+				Finished:   false,
+				GraceUntil: &expired,
+			},
+			cleanupCount: 0,
+			countAfter:   1,
+		},
+		{
+			name: "no grace keeps legacy unmanaged state",
+			state: State{
+				TTL:      -2,
+				Finished: true,
+			},
+			cleanupCount: 0,
+			countAfter:   1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			states := NewStates()
+			states.SetStates([]State{test.state})
+
+			cleanupCount, _ := states.Cleanup()
+
 			assert.Equal(t, test.cleanupCount, cleanupCount)
 			assert.Equal(t, test.countAfter, states.Count())
 		})
