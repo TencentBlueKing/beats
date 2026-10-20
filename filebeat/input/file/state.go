@@ -45,6 +45,7 @@ type State struct {
 	Offset         int64             `json:"offset"`
 	Timestamp      time.Time         `json:"timestamp"`
 	TTL            time.Duration     `json:"ttl"`
+	GraceUntil     *time.Time        `json:"grace_until,omitempty"`
 	Type           string            `json:"type"`
 	Meta           map[string]string `json:"meta"`
 	FileStateOS    file.StateOS

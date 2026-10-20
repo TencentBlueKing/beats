@@ -238,6 +238,7 @@ func (p *Input) loadStates(states []file.State) error {
 				// Check if state source belongs to this input. If yes, update the state.
 				if p.matchesMeta(state.Meta) {
 					state.TTL = -1
+					state.GraceUntil = nil
 
 					// In case an input is tried to be started with an unfinished state matching the glob pattern
 					if !state.Finished {
@@ -355,11 +356,25 @@ func (p *Input) removeState(state file.State) {
 		return
 	}
 
-	state.TTL = 0
+	state = p.markStateForCleanup(state, 0)
 	err := p.updateState(state)
 	if err != nil {
 		logp.Err("File cleanup state update error: %s", err)
 	}
+}
+
+func (p *Input) markStateForCleanup(state file.State, fallbackTTL time.Duration) file.State {
+	if p.config.CleanRemovedGrace > 0 {
+		state.TTL = -2
+		if state.GraceUntil == nil {
+			graceUntil := time.Now().Add(p.config.CleanRemovedGrace)
+			state.GraceUntil = &graceUntil
+		}
+	} else {
+		state.TTL = fallbackTTL
+	}
+
+	return state
 }
 
 // matchesMeta returns true in case the given meta is equal to the one of this input, false if not
@@ -535,6 +550,12 @@ func (p *Input) scan() {
 func (p *Input) harvestExistingFile(newState file.State, oldState file.State) {
 	logp.Debug("input", "Update existing file for harvesting: %s, offset: %v", newState.Source, oldState.Offset)
 
+	hadGrace := oldState.GraceUntil != nil
+	if hadGrace {
+		oldState.GraceUntil = nil
+		oldState.TTL = -1
+	}
+
 	// No harvester is running for the file, start a new harvester
 	// It is important here that only the size is checked and not modification time, as modification time could be incorrect on windows
 	// https://blogs.technet.microsoft.com/asiasupp/2010/12/14/file-date-modified-property-are-not-updating-while-modifying-a-file-without-closing-it/
@@ -573,10 +594,14 @@ func (p *Input) harvestExistingFile(newState file.State, oldState file.State) {
 			logp.Debug("input", "Updating state for renamed file: %s -> %s, Current offset: %v", oldState.Source, newState.Source, oldState.Offset)
 			// Update state because of file rotation
 			oldState.Source = newState.Source
+			oldState.Fileinfo = newState.Fileinfo
+			oldState.FileIdentifier = newState.FileIdentifier
+			oldState.Id = ""
 			err := p.updateState(oldState)
 			if err != nil {
 				logp.Err("File rotation state update error: %s", err)
 			}
+			hadGrace = false
 
 			filesRenamed.Add(1)
 		} else {
@@ -589,6 +614,14 @@ func (p *Input) harvestExistingFile(newState file.State, oldState file.State) {
 		logp.Debug("input", "Harvester for file is still running: %s", newState.Source)
 	} else {
 		logp.Debug("input", "File didn't change: %s", newState.Source)
+		if hadGrace {
+			oldState.Fileinfo = newState.Fileinfo
+			oldState.FileIdentifier = newState.FileIdentifier
+			oldState.Id = ""
+			if err := p.updateState(oldState); err != nil {
+				logp.Err("File grace state update error: %s", err)
+			}
+		}
 	}
 }
 
@@ -721,7 +754,7 @@ func (p *Input) Stop() {
 
 		// Reset File state
 		for _, state := range p.states.GetStates() {
-			state.TTL = -2
+			state = p.markStateForCleanup(state, -2)
 
 			// Update input states and send new states to registry
 			p.updateState(state)

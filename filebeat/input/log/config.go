@@ -47,16 +47,17 @@ var (
 		CleanInactive: 0,
 
 		// Input
-		Enabled:        true,
-		IgnoreOlder:    0,
-		ScanFrequency:  10 * time.Second,
-		CleanRemoved:   true,
-		HarvesterLimit: 0,
-		Symlinks:       false,
-		TailFiles:      false,
-		ScanSort:       "",
-		ScanOrder:      "asc",
-		RecursiveGlob:  true,
+		Enabled:           true,
+		IgnoreOlder:       0,
+		ScanFrequency:     10 * time.Second,
+		CleanRemoved:      true,
+		CleanRemovedGrace: 0,
+		HarvesterLimit:    0,
+		Symlinks:          false,
+		TailFiles:         false,
+		ScanSort:          "",
+		ScanOrder:         "asc",
+		RecursiveGlob:     true,
 
 		// Harvester
 		ReuseHarvester: true,
@@ -102,16 +103,17 @@ type config struct {
 	CleanInactive time.Duration `config:"clean_inactive" validate:"min=0"`
 
 	// Input
-	Enabled        bool            `config:"enabled"`
-	ExcludeFiles   []match.Matcher `config:"exclude_files"`
-	IgnoreOlder    time.Duration   `config:"ignore_older"`
-	Paths          []string        `config:"paths"`
-	ScanFrequency  time.Duration   `config:"scan_frequency" validate:"min=0,nonzero"`
-	CleanRemoved   bool            `config:"clean_removed"`
-	HarvesterLimit uint32          `config:"harvester_limit" validate:"min=0"`
-	Symlinks       bool            `config:"symlinks"`
-	TailFiles      bool            `config:"tail_files"`
-	RecursiveGlob  bool            `config:"recursive_glob.enabled"`
+	Enabled           bool            `config:"enabled"`
+	ExcludeFiles      []match.Matcher `config:"exclude_files"`
+	IgnoreOlder       time.Duration   `config:"ignore_older"`
+	Paths             []string        `config:"paths"`
+	ScanFrequency     time.Duration   `config:"scan_frequency" validate:"min=0,nonzero"`
+	CleanRemoved      bool            `config:"clean_removed"`
+	CleanRemovedGrace time.Duration   `config:"clean_removed_grace" validate:"min=0"`
+	HarvesterLimit    uint32          `config:"harvester_limit" validate:"min=0"`
+	Symlinks          bool            `config:"symlinks"`
+	TailFiles         bool            `config:"tail_files"`
+	RecursiveGlob     bool            `config:"recursive_glob.enabled"`
 
 	// Harvester
 	ReuseHarvester bool   `config:"reuse_harvester"`
