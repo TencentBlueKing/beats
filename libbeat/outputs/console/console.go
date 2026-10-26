@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/elastic/beats/libbeat/beat"
@@ -32,6 +33,37 @@ import (
 	"github.com/elastic/beats/libbeat/outputs/codec/json"
 	"github.com/elastic/beats/libbeat/publisher"
 )
+
+// errorHandler receives the first console output failure observed by the
+// preview coordinator. It is process-global because the console output may be
+// created while the publisher pipeline is initialised, before a coordinator has
+// a chance to grab the output instance. The handler must not block; callers
+// only record the error and wake their coordinator.
+var (
+	errorHandlerMu sync.RWMutex
+	errorHandler   func(error)
+)
+
+// SetErrorHandler installs a process-wide console error observer. Passing nil
+// restores the original behavior. It is safe to call before or after the
+// console output has been created.
+func SetErrorHandler(handler func(error)) {
+	errorHandlerMu.Lock()
+	errorHandler = handler
+	errorHandlerMu.Unlock()
+}
+
+func notifyError(err error) {
+	if err == nil {
+		return
+	}
+	errorHandlerMu.RLock()
+	handler := errorHandler
+	errorHandlerMu.RUnlock()
+	if handler != nil {
+		handler(err)
+	}
+}
 
 type console struct {
 	out      *os.File
@@ -114,7 +146,14 @@ func (c *console) Publish(batch publisher.Batch) error {
 		}
 	}
 
-	c.writer.Flush()
+	if err := c.writer.Flush(); err != nil {
+		// Flush errors used to be dropped on the floor while the batch was
+		// still ACKed. Report them to the optional preview observer; the ACK
+		// remains the pipeline's in-flight recycling signal only.
+		c.observer.WriteError(err)
+		notifyError(fmt.Errorf("console output flush failed: %w", err))
+		logp.Critical("Unable to flush console output: %v", err)
+	}
 	batch.ACK()
 
 	st.Dropped(dropped)
@@ -128,6 +167,7 @@ var nl = []byte("\n")
 func (c *console) publishEvent(event *publisher.Event) bool {
 	serializedEvent, err := c.codec.Encode(c.index, &event.Content)
 	if err != nil {
+		notifyError(fmt.Errorf("console output encoding failed: %w", err))
 		if !event.Guaranteed() {
 			return false
 		}
@@ -139,12 +179,14 @@ func (c *console) publishEvent(event *publisher.Event) bool {
 
 	if err := c.writeBuffer(serializedEvent); err != nil {
 		c.observer.WriteError(err)
+		notifyError(fmt.Errorf("console output write failed: %w", err))
 		logp.Critical("Unable to publish events to console: %v", err)
 		return false
 	}
 
 	if err := c.writeBuffer(nl); err != nil {
 		c.observer.WriteError(err)
+		notifyError(fmt.Errorf("console output write failed: %w", err))
 		logp.Critical("Error when appending newline to event: %v", err)
 		return false
 	}
