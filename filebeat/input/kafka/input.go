@@ -138,7 +138,7 @@ func (input *kafkaInput) Run() {
 			for context.Err() == nil {
 				// Connect to Kafka with a new consumer group.
 				consumerGroup, err := sarama.NewConsumerGroup(
-					input.config.Hosts, input.config.GroupID, input.saramaConfig)
+					input.config.Hosts, *input.config.GroupID, input.saramaConfig)
 				if err != nil {
 					input.log.Errorw(
 						"Error initializing kafka consumer group", "error", err)

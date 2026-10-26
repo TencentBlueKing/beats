@@ -19,6 +19,7 @@ package kafka
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Shopify/sarama"
 	"github.com/stretchr/testify/assert"
@@ -114,4 +115,217 @@ func TestSASLMechanismConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func kafkaConfigMap() common.MapStr {
+	return common.MapStr{
+		"hosts":    []string{"localhost:9092"},
+		"topics":   []string{"test"},
+		"group_id": "test-group",
+	}
+}
+
+func directReadConfigMap() common.MapStr {
+	cfg := kafkaConfigMap()
+	delete(cfg, "group_id")
+	cfg["direct_read"] = common.MapStr{
+		"enabled":    true,
+		"max_events": 30,
+		"timeout":    "10s",
+	}
+	return cfg
+}
+
+func TestKafkaInputConfigValidation(t *testing.T) {
+	tests := map[string]struct {
+		config  common.MapStr
+		wantErr string
+	}{
+		"consumer group minimal": {
+			config: kafkaConfigMap(),
+		},
+		"consumer group missing group_id": {
+			config: func() common.MapStr {
+				cfg := kafkaConfigMap()
+				delete(cfg, "group_id")
+				return cfg
+			}(),
+			wantErr: "group_id is required",
+		},
+		"consumer group empty group_id": {
+			config: func() common.MapStr {
+				cfg := kafkaConfigMap()
+				cfg["group_id"] = ""
+				return cfg
+			}(),
+			wantErr: "group_id is required",
+		},
+		"direct read minimal": {
+			config: directReadConfigMap(),
+		},
+		"direct read with group_id": {
+			config: func() common.MapStr {
+				cfg := directReadConfigMap()
+				cfg["group_id"] = "test-group"
+				return cfg
+			}(),
+			wantErr: "group_id must not be set",
+		},
+		"direct read with empty group_id": {
+			config: func() common.MapStr {
+				cfg := directReadConfigMap()
+				cfg["group_id"] = ""
+				return cfg
+			}(),
+			wantErr: "group_id must not be set",
+		},
+		"direct read missing max_events": {
+			config: func() common.MapStr {
+				cfg := directReadConfigMap()
+				delete(cfg["direct_read"].(common.MapStr), "max_events")
+				return cfg
+			}(),
+			wantErr: "direct_read.max_events is required",
+		},
+		"direct read missing timeout": {
+			config: func() common.MapStr {
+				cfg := directReadConfigMap()
+				delete(cfg["direct_read"].(common.MapStr), "timeout")
+				return cfg
+			}(),
+			wantErr: "direct_read.timeout is required",
+		},
+		"direct read zero max_events": {
+			config: func() common.MapStr {
+				cfg := directReadConfigMap()
+				cfg["direct_read"].(common.MapStr)["max_events"] = 0
+				return cfg
+			}(),
+			wantErr: "direct_read.max_events must be between",
+		},
+		"direct read too many max_events": {
+			config: func() common.MapStr {
+				cfg := directReadConfigMap()
+				cfg["direct_read"].(common.MapStr)["max_events"] = 1001
+				return cfg
+			}(),
+			wantErr: "direct_read.max_events must be between",
+		},
+		"direct read too short timeout": {
+			config: func() common.MapStr {
+				cfg := directReadConfigMap()
+				cfg["direct_read"].(common.MapStr)["timeout"] = "999ms"
+				return cfg
+			}(),
+			wantErr: "direct_read.timeout must be between",
+		},
+		"direct read too long timeout": {
+			config: func() common.MapStr {
+				cfg := directReadConfigMap()
+				cfg["direct_read"].(common.MapStr)["timeout"] = "61s"
+				return cfg
+			}(),
+			wantErr: "direct_read.timeout must be between",
+		},
+		"disabled direct read with max_events": {
+			config: func() common.MapStr {
+				cfg := kafkaConfigMap()
+				cfg["direct_read"] = common.MapStr{
+					"enabled":    false,
+					"max_events": 30,
+				}
+				return cfg
+			}(),
+			wantErr: "require direct_read.enabled",
+		},
+		"disabled direct read with timeout": {
+			config: func() common.MapStr {
+				cfg := kafkaConfigMap()
+				cfg["direct_read"] = common.MapStr{
+					"enabled": false,
+					"timeout": "10s",
+				}
+				return cfg
+			}(),
+			wantErr: "require direct_read.enabled",
+		},
+		"empty topics": {
+			config: func() common.MapStr {
+				cfg := kafkaConfigMap()
+				cfg["topics"] = []string{}
+				return cfg
+			}(),
+			wantErr: "empty field accessing 'topics'",
+		},
+		"missing hosts": {
+			config: func() common.MapStr {
+				cfg := kafkaConfigMap()
+				delete(cfg, "hosts")
+				return cfg
+			}(),
+			wantErr: "missing required field accessing 'hosts'",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := defaultConfig()
+			err := common.MustNewConfigFrom(test.config).Unpack(&config)
+			if test.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), test.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestKafkaInputDirectReadConfig(t *testing.T) {
+	config := defaultConfig()
+	require.NoError(t, common.MustNewConfigFrom(directReadConfigMap()).Unpack(&config))
+
+	require.Nil(t, config.GroupID)
+	require.NotNil(t, config.DirectRead)
+	assert.True(t, config.DirectRead.Enabled)
+	require.NotNil(t, config.DirectRead.MaxEvents)
+	require.NotNil(t, config.DirectRead.Timeout)
+	assert.Equal(t, 30, *config.DirectRead.MaxEvents)
+	assert.Equal(t, 10*time.Second, *config.DirectRead.Timeout)
+
+	// Boundaries are accepted by the collector guard rails.
+	for _, tc := range []struct {
+		name    string
+		events  int
+		timeout string
+	}{
+		{name: "lower bounds", events: 1, timeout: "1s"},
+		{name: "upper bounds", events: 1000, timeout: "60s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgMap := directReadConfigMap()
+			cfgMap["direct_read"].(common.MapStr)["max_events"] = tc.events
+			cfgMap["direct_read"].(common.MapStr)["timeout"] = tc.timeout
+
+			cfg := defaultConfig()
+			require.NoError(t, common.MustNewConfigFrom(cfgMap).Unpack(&cfg))
+			assert.Equal(t, tc.events, *cfg.DirectRead.MaxEvents)
+		})
+	}
+}
+
+func TestKafkaInputGroupIDPointer(t *testing.T) {
+	// An explicitly empty group_id is not the same as an absent one. The
+	// consumer-group path must reject it and direct_read must reject both.
+	config := defaultConfig()
+	require.NoError(t, common.MustNewConfigFrom(kafkaConfigMap()).Unpack(&config))
+	require.NotNil(t, config.GroupID)
+	assert.Equal(t, "test-group", *config.GroupID)
+
+	cfgMap := kafkaConfigMap()
+	cfgMap["group_id"] = ""
+	config = defaultConfig()
+	err := common.MustNewConfigFrom(cfgMap).Unpack(&config)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "group_id is required")
 }
