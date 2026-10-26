@@ -249,6 +249,18 @@ func TestKafkaInputConfigValidation(t *testing.T) {
 			}(),
 			wantErr: "require direct_read.enabled",
 		},
+		"disabled direct read with max_events and missing group_id": {
+			config: func() common.MapStr {
+				cfg := kafkaConfigMap()
+				delete(cfg, "group_id")
+				cfg["direct_read"] = common.MapStr{
+					"enabled":    false,
+					"max_events": 30,
+				}
+				return cfg
+			}(),
+			wantErr: "require direct_read.enabled",
+		},
 		"empty topics": {
 			config: func() common.MapStr {
 				cfg := kafkaConfigMap()
@@ -279,6 +291,18 @@ func TestKafkaInputConfigValidation(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestKafkaInputValidateEmptyTopics(t *testing.T) {
+	config := defaultConfig()
+	config.Hosts = []string{"kafka:9092"}
+	config.Topics = nil
+	groupID := "group"
+	config.GroupID = &groupID
+
+	err := config.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no topics configured")
 }
 
 func TestKafkaInputDirectReadConfig(t *testing.T) {

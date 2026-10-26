@@ -197,6 +197,12 @@ func (c *kafkaInputConfig) Validate() error {
 		return err
 	}
 
+	// Validate the direct-read block before group_id. A disabled block that
+	// still carries limits is a config error even when group_id is also missing.
+	if err := c.DirectRead.validate(); err != nil {
+		return err
+	}
+
 	direct := c.DirectRead != nil && c.DirectRead.Enabled
 	if direct {
 		// A direct preview must never join or create a consumer group. An
@@ -208,7 +214,7 @@ func (c *kafkaInputConfig) Validate() error {
 		return errors.New("group_id is required when direct_read is disabled")
 	}
 
-	return c.DirectRead.validate()
+	return nil
 }
 
 func newSaramaConfig(config kafkaInputConfig) (*sarama.Config, error) {
