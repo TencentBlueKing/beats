@@ -38,8 +38,10 @@ type fakePartitionConsumer struct {
 	messages chan *sarama.ConsumerMessage
 	errors   chan *sarama.ConsumerError
 
-	closeOnce sync.Once
-	closed    chan struct{}
+	closeOnce      sync.Once
+	closed         chan struct{}
+	mu             sync.Mutex
+	messagesClosed bool
 }
 
 func newFakePartitionConsumer() *fakePartitionConsumer {
@@ -50,10 +52,20 @@ func newFakePartitionConsumer() *fakePartitionConsumer {
 	}
 }
 
+func (p *fakePartitionConsumer) closeMessages() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.messagesClosed {
+		return
+	}
+	p.messagesClosed = true
+	close(p.messages)
+}
+
 func (p *fakePartitionConsumer) AsyncClose() {
 	p.closeOnce.Do(func() {
 		close(p.closed)
-		close(p.messages)
+		p.closeMessages()
 		close(p.errors)
 	})
 }
@@ -291,7 +303,9 @@ func TestDirectReadConnectFailure(t *testing.T) {
 	cfg.ConnectBackoff = 10 * time.Millisecond
 
 	outlet := &fakeOutlet{}
+	attempts := 0
 	input := newDirectTestInput(t, cfg, outlet, func(addrs []string, conf *sarama.Config) (directConsumer, error) {
+		attempts++
 		return nil, errors.New("broker unreachable")
 	})
 
@@ -299,6 +313,7 @@ func TestDirectReadConnectFailure(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "connecting to kafka")
 	assert.Contains(t, err.Error(), "broker unreachable")
+	assert.Equal(t, directConnectAttempts, attempts)
 }
 
 func TestDirectReadDeadlineDuringConnect(t *testing.T) {
@@ -449,3 +464,135 @@ func TestCompletionUnsupportedForConsumerGroup(t *testing.T) {
 	assert.False(t, ok)
 	assert.Nil(t, completion)
 }
+
+func TestApplyDirectLimitsClampsFetchDefault(t *testing.T) {
+	cfg := sarama.NewConfig()
+	cfg.Consumer.Fetch.Default = 8 << 20
+	require.NoError(t, applyDirectLimits(cfg, 10*time.Second))
+	assert.Equal(t, int32(directFetchMaxBytes), cfg.Consumer.Fetch.Max)
+	assert.LessOrEqual(t, cfg.Consumer.Fetch.Default, cfg.Consumer.Fetch.Max)
+}
+
+func TestDirectReadDefaultsToNewest(t *testing.T) {
+	cfg := directTestConfig(1, 50*time.Millisecond)
+	assert.Equal(t, initialOffsetNewest, cfg.InitialOffset)
+
+	consumer := newFakeDirectConsumer()
+	consumer.topics["test-topic"] = []int32{0}
+	consumer.partitions["test-topic/0"] = newFakePartitionConsumer()
+
+	input := newDirectTestInput(t, cfg, &fakeOutlet{}, func(addrs []string, conf *sarama.Config) (directConsumer, error) {
+		return consumer, nil
+	})
+	require.NoError(t, runDirectToCompletion(t, input))
+
+	consumer.mu.Lock()
+	offsets := append([]int64(nil), consumer.offsets...)
+	consumer.mu.Unlock()
+	require.Equal(t, []int64{sarama.OffsetNewest}, offsets)
+}
+
+func TestDirectReadConsumerErrorIsNotTimeoutSuccess(t *testing.T) {
+	cfg := directTestConfig(10, 2*time.Second)
+	consumer := newFakeDirectConsumer()
+	consumer.topics["test-topic"] = []int32{0}
+	pc := newFakePartitionConsumer()
+	consumer.partitions["test-topic/0"] = pc
+	pc.errors <- &sarama.ConsumerError{
+		Topic:     "test-topic",
+		Partition: 0,
+		Err:       errors.New("offset out of range"),
+	}
+	// Sarama closes Messages before Errors. Leave Errors open so the reader
+	// has to keep selecting after Messages is already closed.
+	pc.closeMessages()
+
+	input := newDirectTestInput(t, cfg, &fakeOutlet{}, func(addrs []string, conf *sarama.Config) (directConsumer, error) {
+		return consumer, nil
+	})
+	err := runDirectToCompletion(t, input)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "offset out of range")
+}
+
+func TestDirectReadBlockedOutletTimesOut(t *testing.T) {
+	cfg := directTestConfig(10, 80*time.Millisecond)
+	release := make(chan struct{})
+	defer close(release)
+	outlet := &blockingOutlet{started: make(chan struct{}), release: release}
+
+	consumer := newFakeDirectConsumer()
+	consumer.topics["test-topic"] = []int32{0}
+	consumer.partitions["test-topic/0"] = newFakePartitionConsumer()
+	input := newDirectTestInput(t, cfg, outlet, func(addrs []string, conf *sarama.Config) (directConsumer, error) {
+		return consumer, nil
+	})
+	consumer.addMessages("test-topic", 0, "blocked")
+
+	start := time.Now()
+	err := runDirectToCompletion(t, input)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timed out delivering")
+	assert.Less(t, time.Since(start), time.Second)
+}
+
+func TestDirectReadPanicCompletes(t *testing.T) {
+	cfg := directTestConfig(1, time.Second)
+	consumer := newFakeDirectConsumer()
+	consumer.topics["test-topic"] = []int32{0}
+	consumer.partitions["test-topic/0"] = newFakePartitionConsumer()
+	input := newDirectTestInput(t, cfg, panicOutlet{}, func(addrs []string, conf *sarama.Config) (directConsumer, error) {
+		return consumer, nil
+	})
+	consumer.addMessages("test-topic", 0, "boom")
+
+	err := runDirectToCompletion(t, input)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "panic")
+	assert.Contains(t, err.Error(), "outlet panic")
+}
+
+func TestDirectReadStopWaitsForCompletion(t *testing.T) {
+	cfg := directTestConfig(10, 5*time.Second)
+	consumer := newFakeDirectConsumer()
+	consumer.topics["test-topic"] = []int32{0}
+	consumer.partitions["test-topic/0"] = newFakePartitionConsumer()
+	connected := make(chan struct{})
+	input := newDirectTestInput(t, cfg, &fakeOutlet{}, func(addrs []string, conf *sarama.Config) (directConsumer, error) {
+		close(connected)
+		return consumer, nil
+	})
+
+	input.Run()
+	<-connected
+	close(input.context.Done)
+	input.Stop()
+
+	select {
+	case <-input.completion:
+	default:
+		t.Fatal("Stop returned before the direct read completed")
+	}
+	require.Error(t, input.CompletionErr())
+	assert.Contains(t, input.CompletionErr().Error(), "canceled")
+}
+
+type blockingOutlet struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (o *blockingOutlet) OnEvent(*util.Data) bool {
+	o.once.Do(func() { close(o.started) })
+	<-o.release
+	return true
+}
+func (o *blockingOutlet) Close() error          { return nil }
+func (o *blockingOutlet) Done() <-chan struct{} { return nil }
+
+type panicOutlet struct{}
+
+func (panicOutlet) OnEvent(*util.Data) bool { panic("outlet panic") }
+func (panicOutlet) Close() error            { return nil }
+func (panicOutlet) Done() <-chan struct{}   { return nil }

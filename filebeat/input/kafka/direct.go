@@ -27,6 +27,7 @@ import (
 	"github.com/Shopify/sarama"
 
 	"github.com/elastic/beats/filebeat/util"
+	"github.com/elastic/beats/libbeat/beat"
 	"github.com/elastic/beats/libbeat/common/backoff"
 )
 
@@ -39,6 +40,10 @@ const (
 	directMaxMessageBytes   = 10 << 20
 	directConnectAttempts   = 2
 	directNetTimeoutCap     = 10 * time.Second
+	// directReaderShutdownBudget bounds partition-reader and consumer close
+	// after the read window. A stuck broker close must not hold Completion()
+	// open; the external timeout remains the process-level backstop.
+	directReaderShutdownBudget = 5 * time.Second
 )
 
 // directConsumer is the narrow Sarama consumer surface used by the direct
@@ -93,7 +98,9 @@ func (input *kafkaInput) consumeDirect() error {
 	}()
 
 	saramaConfig := *input.saramaConfig
-	applyDirectLimits(&saramaConfig, *cfg.Timeout)
+	if err := applyDirectLimits(&saramaConfig, *cfg.Timeout); err != nil {
+		return err
+	}
 
 	factory := input.directConsumerFactory
 	if factory == nil {
@@ -128,7 +135,7 @@ func (input *kafkaInput) consumeDirect() error {
 // applyDirectLimits copies newSaramaConfig's result for the direct branch. Only
 // bounded-read limits are changed; TLS, SASL, version and consumer parameters
 // shared with the consumer-group path are left untouched.
-func applyDirectLimits(cfg *sarama.Config, timeout time.Duration) {
+func applyDirectLimits(cfg *sarama.Config, timeout time.Duration) error {
 	cfg.ChannelBufferSize = directChannelBufferSize
 	cfg.Consumer.Fetch.Max = directFetchMaxBytes
 
@@ -152,6 +159,16 @@ func applyDirectLimits(cfg *sarama.Config, timeout time.Duration) {
 	// Keep one jittered retry; the default of three long backoffs can outlive
 	// a short preview window.
 	cfg.Metadata.Retry.Max = 1
+
+	// The 4MiB fetch cap can otherwise leave a user-configured fetch.default
+	// larger than Fetch.Max. Clamp it; Sarama's Validate does not check this.
+	if cfg.Consumer.Fetch.Max > 0 && cfg.Consumer.Fetch.Default > cfg.Consumer.Fetch.Max {
+		cfg.Consumer.Fetch.Default = cfg.Consumer.Fetch.Max
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("direct read: invalid sarama config: %w", err)
+	}
+	return nil
 }
 
 // connectDirect creates the Sarama consumer with a bounded number of attempts.
@@ -183,9 +200,14 @@ func (input *kafkaInput) connectDirect(
 			return nil, directAbortError(ctx, deadline, "before connecting to kafka")
 		}
 
-		consumer, err := factory(input.config.Hosts, saramaConfig)
+		consumer, err := input.dialDirect(ctx, deadline, factory, saramaConfig)
 		if err == nil {
 			return consumer, nil
+		}
+		// A deadline or cancellation during dial is already a terminal preview
+		// error. Do not replace it with the factory's own failure.
+		if ctx.Err() != nil {
+			return nil, err
 		}
 		lastErr = err
 
@@ -235,6 +257,9 @@ func (input *kafkaInput) subscribeDirect(
 	}
 
 	result := make([]*directPartition, 0, total)
+	// initial_offset is shared with the consumer-group path and still defaults
+	// to newest. newest reads only messages produced after the subscription;
+	// a preview of data that already exists must set oldest explicitly.
 	offset := input.config.InitialOffset.asSaramaOffset()
 	for _, topic := range input.config.Topics {
 		for _, partition := range partitions[topic] {
@@ -252,15 +277,56 @@ func (input *kafkaInput) subscribeDirect(
 	return result, nil
 }
 
+// dialDirect runs one connection attempt without letting it ignore the
+// preview deadline. The factory may still finish after cancellation; any
+// consumer it created is closed instead of being returned.
+func (input *kafkaInput) dialDirect(
+	ctx context.Context,
+	deadline time.Time,
+	factory directConsumerFactory,
+	saramaConfig *sarama.Config,
+) (directConsumer, error) {
+	type dialResult struct {
+		consumer directConsumer
+		err      error
+	}
+	result := make(chan dialResult, 1)
+	go func() {
+		consumer, err := factory(input.config.Hosts, saramaConfig)
+		result <- dialResult{consumer: consumer, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		go func() {
+			res := <-result
+			if res.consumer != nil {
+				_ = res.consumer.Close()
+			}
+		}()
+		return nil, directAbortError(ctx, deadline, "before connecting to kafka")
+	case res := <-result:
+		if err := ctx.Err(); err != nil {
+			if res.consumer != nil {
+				_ = res.consumer.Close()
+			}
+			return nil, directAbortError(ctx, deadline, "before connecting to kafka")
+		}
+		return res.consumer, res.err
+	}
+}
+
 // runDirectLoop owns the single aggregation outlet, the event budget and the
 // shutdown of all readers. Partition goroutines only read; all expansion and
 // OnEvent calls happen here so one message expanding to many events cannot
-// overshoot max_events.
+// overshoot max_events. Cleanup is deferred so a panic still closes partition
+// consumers. A consumer error drained after the readers exit wins over a
+// deadline, which would otherwise look like an empty successful preview.
 func (input *kafkaInput) runDirectLoop(
 	ctx context.Context,
 	consumer directConsumer,
 	partitions []*directPartition,
-) error {
+) (terminalErr error) {
 	stopCh := make(chan struct{})
 	var stopOnce sync.Once
 	stop := func() {
@@ -281,28 +347,39 @@ func (input *kafkaInput) runDirectLoop(
 
 	maxEvents := *input.config.DirectRead.MaxEvents
 	sent := 0
-	var terminalErr error
-loop:
-	for {
-		if sent >= maxEvents {
-			break
+	defer func() {
+		stop()
+		input.closeDirectPartitions(partitions)
+		if err := waitDirectReaders(&readers); err != nil && terminalErr == nil && sent < maxEvents {
+			terminalErr = err
 		}
+		// Readers send before returning. Drain only after they have finished, and
+		// do not turn a full successful budget into a failure because shutdown
+		// itself produced a late error.
+		if err := drainDirectReadErr(readErr); err != nil && terminalErr == nil && sent < maxEvents {
+			terminalErr = err
+		}
+		if err := closeDirectConsumer(consumer); err != nil && terminalErr == nil && sent < maxEvents {
+			terminalErr = err
+		}
+		if terminalErr == nil && sent < maxEvents {
+			if err := ctx.Err(); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+				terminalErr = errors.New("direct read: canceled while reading")
+			}
+		}
+	}()
 
+	for sent < maxEvents {
 		select {
 		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				// The subscription is healthy and the read window expired; fewer
-				// than max_events (or zero) is a normal preview result.
-				break loop
-			}
-			terminalErr = errors.New("direct read: canceled while reading")
-			break loop
-
+			return
 		case err := <-readErr:
 			terminalErr = err
-			break loop
-
+			return
 		case message := <-messages:
+			if ctx.Err() != nil {
+				return
+			}
 			events := createEvents(
 				input.config.Version,
 				input.config.ExpandEventListFromField,
@@ -313,29 +390,23 @@ loop:
 			)
 			for i := range events {
 				if sent >= maxEvents {
-					break
+					return
 				}
-				if !input.outlet.OnEvent(&util.Data{Event: events[i]}) {
-					terminalErr = errors.New("direct read: outlet rejected an event")
-					break loop
+				if err := input.publishDirectEvent(ctx, events[i]); err != nil {
+					terminalErr = err
+					return
 				}
 				sent++
 			}
 		}
 	}
-
-	stop()
-	input.closeDirectPartitions(partitions)
-	readers.Wait()
-	if err := consumer.Close(); err != nil && terminalErr == nil {
-		terminalErr = fmt.Errorf("direct read: closing kafka consumer: %w", err)
-	}
-	return terminalErr
+	return
 }
 
-// readDirectPartition forwards messages until it is stopped. After a stop it
-// keeps draining Messages/Errors until Sarama closes them, so closing the
-// partition consumer cannot block on an unread channel.
+// readDirectPartition forwards messages until it is stopped. Sarama closes
+// Messages before Errors, and a select can observe the closed Messages channel
+// while an error is still buffered. Both channels are drained to completion;
+// a closed channel is set to nil so it drops out of the select.
 func (input *kafkaInput) readDirectPartition(
 	partition *directPartition,
 	messages chan<- directMessage,
@@ -344,25 +415,22 @@ func (input *kafkaInput) readDirectPartition(
 ) {
 	forward := true
 	stop := stopCh
-	for {
+	messageCh := partition.pc.Messages()
+	errorCh := partition.pc.Errors()
+	for messageCh != nil || errorCh != nil {
 		select {
-		case message, ok := <-partition.pc.Messages():
+		case message, ok := <-messageCh:
 			if !ok {
-				return
-			}
-			if message == nil {
+				messageCh = nil
 				continue
 			}
-			if !forward {
+			if message == nil || !forward {
 				continue
 			}
 			if size := consumerMessageSize(message); size > directMaxMessageBytes {
-				select {
-				case readErr <- fmt.Errorf(
+				input.reportDirectReadErr(readErr, fmt.Errorf(
 					"direct read: message %s/%d offset %d is %d bytes, limit is %d",
-					partition.topic, partition.partition, message.Offset, size, directMaxMessageBytes):
-				default:
-				}
+					partition.topic, partition.partition, message.Offset, size, directMaxMessageBytes))
 				forward = false
 				stop = nil
 				continue
@@ -378,19 +446,17 @@ func (input *kafkaInput) readDirectPartition(
 				stop = nil
 			}
 
-		case err, ok := <-partition.pc.Errors():
+		case err, ok := <-errorCh:
 			if !ok {
-				return
+				errorCh = nil
+				continue
 			}
 			if !forward || err == nil {
 				continue
 			}
-			select {
-			case readErr <- fmt.Errorf(
+			input.reportDirectReadErr(readErr, fmt.Errorf(
 				"direct read: consumer error %s/%d: %w",
-				partition.topic, partition.partition, err):
-			default:
-			}
+				partition.topic, partition.partition, err))
 			forward = false
 			stop = nil
 
@@ -398,6 +464,101 @@ func (input *kafkaInput) readDirectPartition(
 			forward = false
 			stop = nil
 		}
+	}
+}
+
+func (input *kafkaInput) reportDirectReadErr(readErr chan<- error, err error) {
+	select {
+	case readErr <- err:
+	default:
+	}
+}
+
+// publishDirectEvent delivers one event without letting a blocked outlet hold
+// the read loop past the preview deadline. The OnEvent call itself may still
+// be running after this returns; closing the outlet or exiting the process
+// unblocks it.
+func (input *kafkaInput) publishDirectEvent(ctx context.Context, event beat.Event) error {
+	if err := directDeliveryAbort(ctx.Err()); err != nil {
+		return err
+	}
+	type publishResult struct {
+		ok    bool
+		panic interface{}
+	}
+	done := make(chan publishResult, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- publishResult{panic: r}
+			}
+		}()
+		done <- publishResult{ok: input.outlet.OnEvent(&util.Data{Event: event})}
+	}()
+	select {
+	case result := <-done:
+		if result.panic != nil {
+			return fmt.Errorf("direct read: panic: %v", result.panic)
+		}
+		if !result.ok {
+			return errors.New("direct read: outlet rejected an event")
+		}
+		return nil
+	case <-ctx.Done():
+		return directDeliveryAbort(ctx.Err())
+	}
+}
+
+func directDeliveryAbort(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.New("direct read: timed out delivering an event")
+	}
+	return errors.New("direct read: canceled while delivering an event")
+}
+
+func waitDirectReaders(readers *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		readers.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(directReaderShutdownBudget)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		return errors.New("direct read: timed out waiting for partition readers to stop")
+	}
+}
+
+func closeDirectConsumer(consumer directConsumer) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- consumer.Close()
+	}()
+	timer := time.NewTimer(directReaderShutdownBudget)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("direct read: closing kafka consumer: %w", err)
+		}
+		return nil
+	case <-timer.C:
+		return errors.New("direct read: timed out closing kafka consumer")
+	}
+}
+
+func drainDirectReadErr(readErr <-chan error) error {
+	select {
+	case err := <-readErr:
+		return err
+	default:
+		return nil
 	}
 }
 

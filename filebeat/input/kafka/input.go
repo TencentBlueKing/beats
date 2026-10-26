@@ -141,7 +141,15 @@ func (input *kafkaInput) Run() {
 			input.saramaWaitGroup.Add(1)
 			go func() {
 				defer input.saramaWaitGroup.Done()
-				input.complete(input.consumeDirect())
+				err := func() (err error) {
+					defer func() {
+						if recovered := recover(); recovered != nil {
+							err = fmt.Errorf("direct read: panic: %v", recovered)
+						}
+					}()
+					return input.consumeDirect()
+				}()
+				input.complete(err)
 			}()
 			return
 		}
@@ -216,11 +224,17 @@ func (p *kafkaInput) Reload() {
 	return
 }
 
-// Stop doesn't need to do anything because the kafka consumer group and the
-// input's outlet both have a context based on input.context.Done and will
-// shut themselves down, since the done channel is already closed as part of
-// the shutdown process in Runner.Stop().
+// Stop doesn't need to do anything for a consumer group because that path
+// and the input's outlet both watch input.context.Done, which Runner.Stop
+// closes. Direct read is different: completionErr is written by the goroutine
+// tracked on saramaWaitGroup, immediately before it exits. Waiting for that
+// group makes CompletionErr safe to read once Stop has returned. Callers that
+// only need the result can also block on Completion(); they must not read
+// CompletionErr before either of those happens.
 func (input *kafkaInput) Stop() {
+	if input.isDirectRead() {
+		input.saramaWaitGroup.Wait()
+	}
 }
 
 // Wait should shut down the input and wait for it to complete, however (see
