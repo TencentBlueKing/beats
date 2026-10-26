@@ -189,6 +189,61 @@ func TestRunnerStopIsIdempotent(t *testing.T) {
 	})
 }
 
+type stopGateInput struct {
+	started chan struct{}
+	release chan struct{}
+	stops   int32
+	once    sync.Once
+}
+
+func (i *stopGateInput) Reload() {}
+func (i *stopGateInput) Run() {
+	i.once.Do(func() { close(i.started) })
+}
+func (i *stopGateInput) Stop() {
+	atomic.AddInt32(&i.stops, 1)
+	<-i.release
+}
+func (i *stopGateInput) Wait() {}
+
+func TestRunnerConcurrentStopCallsInputStopOnce(t *testing.T) {
+	const inputType = "concurrent-stop-input"
+	release := make(chan struct{})
+	inp := &stopGateInput{started: make(chan struct{}), release: release}
+	runner := &Runner{
+		config: inputConfig{Type: inputType, ScanFrequency: time.Hour},
+		input:  inp,
+		done:   make(chan struct{}),
+		wg:     &sync.WaitGroup{},
+	}
+	runner.Start()
+	select {
+	case <-inp.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not start")
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		runner.Stop()
+		close(returned)
+	}()
+	go runner.Stop()
+
+	select {
+	case <-returned:
+		t.Fatal("Stop returned before input.Stop was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return after input.Stop was released")
+	}
+	assert.Equal(t, int32(1), atomic.LoadInt32(&inp.stops))
+}
+
 func TestRunnerUsesMeasuredScanDurationForNextInterval(t *testing.T) {
 	defer SetAdaptiveScanIntervalFunc(nil)
 

@@ -39,30 +39,55 @@ import (
 // created while the publisher pipeline is initialised, before a coordinator has
 // a chance to grab the output instance. The handler must not block; callers
 // only record the error and wake their coordinator.
+type consoleErrorObserver struct {
+	fn   func(error)
+	once sync.Once
+}
+
 var (
-	errorHandlerMu sync.RWMutex
-	errorHandler   func(error)
+	errorHandlerMu sync.Mutex
+	errorHandler   *consoleErrorObserver
 )
 
-// SetErrorHandler installs a process-wide console error observer. Passing nil
-// restores the original behavior. It is safe to call before or after the
-// console output has been created.
-func SetErrorHandler(handler func(error)) {
+// SetErrorHandler installs a process-wide console error observer. The handler
+// is invoked at most once per installation and must not block. Passing nil
+// clears the observer. The returned function restores the previous observer.
+// It is safe to call before or after the console output has been created.
+func SetErrorHandler(handler func(error)) (restore func()) {
 	errorHandlerMu.Lock()
-	errorHandler = handler
+	prev := errorHandler
+	if handler == nil {
+		errorHandler = nil
+	} else {
+		errorHandler = &consoleErrorObserver{fn: handler}
+	}
 	errorHandlerMu.Unlock()
+	return func() {
+		errorHandlerMu.Lock()
+		errorHandler = prev
+		errorHandlerMu.Unlock()
+	}
 }
 
 func notifyError(err error) {
 	if err == nil {
 		return
 	}
-	errorHandlerMu.RLock()
-	handler := errorHandler
-	errorHandlerMu.RUnlock()
-	if handler != nil {
-		handler(err)
+	errorHandlerMu.Lock()
+	observer := errorHandler
+	errorHandlerMu.Unlock()
+	if observer == nil || observer.fn == nil {
+		return
 	}
+	observer.once.Do(func() {
+		observer.fn(err)
+	})
+}
+
+func consoleHandlerInstalled() bool {
+	errorHandlerMu.Lock()
+	defer errorHandlerMu.Unlock()
+	return errorHandler != nil && errorHandler.fn != nil
 }
 
 type console struct {
@@ -147,12 +172,15 @@ func (c *console) Publish(batch publisher.Batch) error {
 	}
 
 	if err := c.writer.Flush(); err != nil {
-		// Flush errors used to be dropped on the floor while the batch was
-		// still ACKed. Report them to the optional preview observer; the ACK
-		// remains the pipeline's in-flight recycling signal only.
-		c.observer.WriteError(err)
+		// Flush errors used to be dropped while the batch was still ACKed.
+		// Without a preview observer that remains the behavior, including
+		// metrics and logs. With an observer, report the failure before ACK.
+		// ACK stays the pipeline's in-flight recycling signal only.
+		if consoleHandlerInstalled() {
+			c.observer.WriteError(err)
+			logp.Critical("Unable to flush console output: %v", err)
+		}
 		notifyError(fmt.Errorf("console output flush failed: %w", err))
-		logp.Critical("Unable to flush console output: %v", err)
 	}
 	batch.ACK()
 
