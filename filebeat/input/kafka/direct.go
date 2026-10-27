@@ -40,6 +40,13 @@ const (
 	directMaxMessageBytes   = 10 << 20
 	directConnectAttempts   = 2
 	directNetTimeoutCap     = 10 * time.Second
+	// directSubscribeConcurrency bounds concurrent ConsumePartition calls.
+	// Empty partitions cost about a second each in Sarama's initial offset
+	// request; subscribing 64 of them sequentially can exhaust the whole
+	// timeout before a single reader starts. Bounded parallelism keeps the
+	// subscription phase within two batches for the 128-partition guard while
+	// still avoiding an unbounded burst of broker requests.
+	directSubscribeConcurrency = 64
 	// directReaderShutdownBudget bounds partition-reader and consumer close
 	// after the read window. A stuck broker close must not hold Completion()
 	// open; the external timeout remains the process-level backstop.
@@ -261,18 +268,73 @@ func (input *kafkaInput) subscribeDirect(
 	// to newest. newest reads only messages produced after the subscription;
 	// a preview of data that already exists must set oldest explicitly.
 	offset := input.config.InitialOffset.asSaramaOffset()
+
+	type subscription struct {
+		topic     string
+		partition int32
+	}
+	targets := make([]subscription, 0, total)
 	for _, topic := range input.config.Topics {
 		for _, partition := range partitions[topic] {
-			if err := ctx.Err(); err != nil {
-				return result, directAbortError(ctx, deadline, "before subscribing to kafka partitions")
-			}
-
-			pc, err := consumer.ConsumePartition(topic, partition, offset)
-			if err != nil {
-				return result, fmt.Errorf("direct read: consuming %s/%d: %w", topic, partition, err)
-			}
-			result = append(result, &directPartition{topic: topic, partition: partition, pc: pc})
+			targets = append(targets, subscription{topic: topic, partition: partition})
 		}
+	}
+
+	// All targets are subscribed concurrently. The result and error slices are
+	// indexed per target so no lock is needed; a failed target does not stop the
+	// others, and the caller still receives every created partition consumer for
+	// cleanup. This is intentionally bounded: 128 simultaneous ConsumePartition
+	// calls would create a burst of broker requests.
+	results := make([]*directPartition, len(targets))
+	errs := make([]error, len(targets))
+	jobs := make(chan int, len(targets))
+	for i := range targets {
+		jobs <- i
+	}
+	close(jobs)
+
+	workers := directSubscribeConcurrency
+	if workers > len(targets) {
+		workers = len(targets)
+	}
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				target := targets[index]
+				if err := ctx.Err(); err != nil {
+					errs[index] = directAbortError(ctx, deadline, "before subscribing to kafka partitions")
+					continue
+				}
+
+				pc, err := consumer.ConsumePartition(target.topic, target.partition, offset)
+				if err != nil {
+					errs[index] = fmt.Errorf("direct read: consuming %s/%d: %w", target.topic, target.partition, err)
+					continue
+				}
+				if pc == nil {
+					errs[index] = fmt.Errorf("direct read: consuming %s/%d: nil partition consumer", target.topic, target.partition)
+					continue
+				}
+				results[index] = &directPartition{topic: target.topic, partition: target.partition, pc: pc}
+			}
+		}()
+	}
+	wg.Wait()
+
+	var firstErr error
+	for i := range targets {
+		if results[i] != nil {
+			result = append(result, results[i])
+		}
+		if firstErr == nil && errs[i] != nil {
+			firstErr = errs[i]
+		}
+	}
+	if firstErr != nil {
+		return result, firstErr
 	}
 	return result, nil
 }

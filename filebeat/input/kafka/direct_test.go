@@ -18,6 +18,7 @@
 package kafka
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -331,6 +332,72 @@ func TestDirectReadDeadlineDuringConnect(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "timed out before connecting")
 	assert.Less(t, time.Since(start), time.Second)
+}
+
+type slowSubscribeConsumer struct {
+	partitions []int32
+	delay      time.Duration
+
+	mu        sync.Mutex
+	active    int
+	maxActive int
+	calls     int
+}
+
+func (c *slowSubscribeConsumer) Partitions(string) ([]int32, error) {
+	return append([]int32(nil), c.partitions...), nil
+}
+
+func (c *slowSubscribeConsumer) ConsumePartition(string, int32, int64) (sarama.PartitionConsumer, error) {
+	c.mu.Lock()
+	c.calls++
+	c.active++
+	if c.active > c.maxActive {
+		c.maxActive = c.active
+	}
+	c.mu.Unlock()
+
+	time.Sleep(c.delay)
+
+	c.mu.Lock()
+	c.active--
+	c.mu.Unlock()
+	return newFakePartitionConsumer(), nil
+}
+
+func (c *slowSubscribeConsumer) Close() error { return nil }
+
+func TestSubscribeDirectSubscribesPartitionsConcurrently(t *testing.T) {
+	const partitionCount = 64
+
+	cfg := directTestConfig(1, time.Second)
+	cfg.Topics = []string{"wide-topic"}
+	input := &kafkaInput{config: cfg}
+	consumer := &slowSubscribeConsumer{
+		partitions: make([]int32, partitionCount),
+		delay:      50 * time.Millisecond,
+	}
+	for i := range consumer.partitions {
+		consumer.partitions[i] = int32(i)
+	}
+
+	start := time.Now()
+	parts, err := input.subscribeDirect(context.Background(), time.Now().Add(time.Second), consumer)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.Len(t, parts, partitionCount)
+	input.closeDirectPartitions(parts)
+
+	consumer.mu.Lock()
+	calls, maxActive := consumer.calls, consumer.maxActive
+	consumer.mu.Unlock()
+	assert.Equal(t, partitionCount, calls)
+	assert.LessOrEqual(t, maxActive, directSubscribeConcurrency)
+	// Sequential subscription would take 64*50ms = 3.2s. With bounded
+	// concurrency (64 workers) the 64 targets run in one batch, well under a
+	// second.
+	assert.Less(t, elapsed, time.Second)
 }
 
 func TestDirectReadPartitionLimit(t *testing.T) {
