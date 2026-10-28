@@ -795,6 +795,14 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int)
 		req := &MetadataRequest{Topics: topics, AllowAutoTopicCreation: allowAutoTopicCreation}
 		if client.conf.Version.IsAtLeast(V1_0_0_0) {
 			req.Version = 5
+		} else if client.conf.Version.IsAtLeast(V0_11_0_0) && !client.conf.Metadata.AllowAutoTopicCreation {
+			// Kafka 0.11 supports MetadataRequest v4, the first version that
+			// encodes allow_auto_topic_creation. Without this branch Sarama
+			// would send v1 for 0.11 and silently drop the disabled flag.
+			// Only opt in when auto-creation is explicitly disabled so the
+			// default 0.11 metadata traffic (including full refreshes) keeps
+			// using v1.
+			req.Version = 4
 		} else if client.conf.Version.IsAtLeast(V0_10_0_0) {
 			req.Version = 1
 		}

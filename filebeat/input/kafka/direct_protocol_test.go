@@ -87,6 +87,93 @@ func TestDirectReadMetadataDisablesTopicAutoCreation(t *testing.T) {
 		"the missing topic must be refreshed with a topic-scoped metadata request")
 }
 
+// TestDirectReadKafka011UsesMetadataV4 is the Kafka 0.11 counterpart of
+// TestDirectReadMetadataDisablesTopicAutoCreation. Sarama selects
+// MetadataRequest v5 only for 1.0.0 and newer; for 0.11 its default selection
+// would be v1, which does not encode allow_auto_topic_creation at all. The
+// direct preview must therefore force v4 on the wire for 0.11, otherwise the
+// flag is silently dropped and the broker's auto.create.topics.enable applies.
+func TestDirectReadKafka011UsesMetadataV4(t *testing.T) {
+	response := sarama.NewMockMetadataResponse(t).
+		SetLeader("existing-topic", 0, 1)
+	broker := newMetadataMockBroker(t, response)
+	defer broker.Close()
+
+	cfg := directTestConfig(1, 2*time.Second)
+	cfg.Version = kafka.Version("0.11.0.0")
+	cfg.Hosts = []string{broker.Addr()}
+	cfg.Topics = []string{"missing-preview-topic"}
+
+	input := newDirectTestInput(t, cfg, &fakeOutlet{}, nil)
+	err := runDirectToCompletion(t, input)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing-preview-topic")
+	assert.Contains(t, err.Error(), "does not exist")
+
+	topicRequests := 0
+	fullRequests := 0
+	for _, exchange := range broker.History() {
+		request, ok := exchange.Request.(*sarama.MetadataRequest)
+		if !ok {
+			continue
+		}
+		// Kafka 0.11 supports MetadataRequest v4, the first version that can
+		// carry the auto-creation flag. A v1 request would make the decoded
+		// false meaningless because the broker never receives it.
+		assert.Equal(t, int16(4), request.Version,
+			"metadata request for %v must be v4 on kafka 0.11", request.Topics)
+		// Every metadata request sent by the preview, including the initial
+		// full refresh without topics, must opt out of auto-creation.
+		assert.False(t, request.AllowAutoTopicCreation,
+			"metadata request for %v must not allow auto topic creation", request.Topics)
+		if len(request.Topics) == 0 {
+			fullRequests++
+			continue
+		}
+		topicRequests++
+		for _, topic := range request.Topics {
+			assert.Equal(t, "missing-preview-topic", topic)
+		}
+	}
+	assert.True(t, topicRequests > 0,
+		"the missing topic must be refreshed with a topic-scoped metadata request")
+	assert.True(t, fullRequests > 0,
+		"the client must still perform the initial full metadata refresh")
+}
+
+// TestKafka011DefaultMetadataVersionUnchanged guards the other half of the
+// vendored version-selection change: a Kafka 0.11 client that keeps the
+// default AllowAutoTopicCreation=true must keep sending MetadataRequest v1,
+// including its initial full refresh. Only the direct preview opts into v4.
+func TestKafka011DefaultMetadataVersionUnchanged(t *testing.T) {
+	response := sarama.NewMockMetadataResponse(t).
+		SetLeader("existing-topic", 0, 1)
+	broker := newMetadataMockBroker(t, response)
+	defer broker.Close()
+
+	conf := sarama.NewConfig()
+	conf.Version = sarama.V0_11_0_0
+	require.True(t, conf.Metadata.AllowAutoTopicCreation,
+		"sarama must keep allowing topic auto-creation by default")
+
+	client, err := sarama.NewClient([]string{broker.Addr()}, conf)
+	require.NoError(t, err)
+	defer client.Close()
+
+	metadataRequests := 0
+	for _, exchange := range broker.History() {
+		request, ok := exchange.Request.(*sarama.MetadataRequest)
+		if !ok {
+			continue
+		}
+		metadataRequests++
+		assert.Equal(t, int16(1), request.Version,
+			"default kafka 0.11 metadata traffic must stay on v1")
+	}
+	assert.True(t, metadataRequests > 0,
+		"client creation must perform the initial full metadata refresh")
+}
+
 // TestDirectAutoTopicCreationConfigDefaults proves the new Sarama option keeps
 // the consumer-group path unchanged and only the direct preview opts out.
 func TestDirectAutoTopicCreationConfigDefaults(t *testing.T) {
