@@ -331,7 +331,8 @@ func TestDirectReadDeadlineDuringConnect(t *testing.T) {
 	err := runDirectToCompletion(t, input)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "timed out before connecting")
-	assert.Less(t, time.Since(start), time.Second)
+	assert.True(t, time.Since(start) < time.Second,
+		"connect abort took %s, want less than 1s", time.Since(start))
 }
 
 type slowSubscribeConsumer struct {
@@ -393,11 +394,12 @@ func TestSubscribeDirectSubscribesPartitionsConcurrently(t *testing.T) {
 	calls, maxActive := consumer.calls, consumer.maxActive
 	consumer.mu.Unlock()
 	assert.Equal(t, partitionCount, calls)
-	assert.LessOrEqual(t, maxActive, directSubscribeConcurrency)
+	assert.True(t, maxActive <= directSubscribeConcurrency,
+		"max concurrent subscriptions = %d, want at most %d", maxActive, directSubscribeConcurrency)
 	// Sequential subscription would take 64*50ms = 3.2s. With bounded
 	// concurrency (64 workers) the 64 targets run in one batch, well under a
 	// second.
-	assert.Less(t, elapsed, time.Second)
+	assert.True(t, elapsed < time.Second, "bounded subscription took %s, want less than 1s", elapsed)
 }
 
 func TestDirectReadPartitionLimit(t *testing.T) {
@@ -537,7 +539,9 @@ func TestApplyDirectLimitsClampsFetchDefault(t *testing.T) {
 	cfg.Consumer.Fetch.Default = 8 << 20
 	require.NoError(t, applyDirectLimits(cfg, 10*time.Second))
 	assert.Equal(t, int32(directFetchMaxBytes), cfg.Consumer.Fetch.Max)
-	assert.LessOrEqual(t, cfg.Consumer.Fetch.Default, cfg.Consumer.Fetch.Max)
+	assert.True(t, cfg.Consumer.Fetch.Default <= cfg.Consumer.Fetch.Max,
+		"fetch.default = %d, want at most fetch.max = %d",
+		cfg.Consumer.Fetch.Default, cfg.Consumer.Fetch.Max)
 }
 
 func TestDirectReadDefaultsToNewest(t *testing.T) {
@@ -600,7 +604,8 @@ func TestDirectReadBlockedOutletTimesOut(t *testing.T) {
 	err := runDirectToCompletion(t, input)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "timed out delivering")
-	assert.Less(t, time.Since(start), time.Second)
+	assert.True(t, time.Since(start) < time.Second,
+		"blocked outlet abort took %s, want less than 1s", time.Since(start))
 }
 
 func TestDirectReadPanicCompletes(t *testing.T) {
