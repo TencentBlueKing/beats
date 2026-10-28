@@ -21,6 +21,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -281,6 +283,69 @@ func TestDirectReadExpandedMessageRespectsBudget(t *testing.T) {
 
 	require.NoError(t, runDirectToCompletion(t, input))
 	assert.Equal(t, 3, outlet.count(), "one message expanding to many events must not exceed max_events")
+}
+
+// largeExpandedMessage builds a message whose expand_event_list_from_field
+// array has elements entries. The payload stays small while the expanded form
+// would allocate one event per element.
+func largeExpandedMessage(elements int) []byte {
+	var builder strings.Builder
+	builder.Grow(elements*2 + 16)
+	builder.WriteString(`{"records":[`)
+	for i := 0; i < elements; i++ {
+		if i > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteByte('0')
+	}
+	builder.WriteString(`]}`)
+	return []byte(builder.String())
+}
+
+func TestCreateEventsExpandedListAppliesBudget(t *testing.T) {
+	logger := logp.NewLogger("kafka direct test")
+	message := &sarama.ConsumerMessage{Value: []byte(`{"records":[1,2,3,4,5]}`)}
+
+	// The consumer-group path passes 0 and keeps expanding every element.
+	all := createEvents(defaultConfig().Version, "records", logger, "topic", 0, message, 0)
+	require.Len(t, all, 5)
+
+	limited := createEvents(defaultConfig().Version, "records", logger, "topic", 0, message, 2)
+	require.Len(t, limited, 2)
+}
+
+// TestDirectReadExpandedMessageBudgetBoundsWork is the regression test for the
+// max_events=1 large-array report: the direct preview must not serialize and
+// materialize every expanded element before applying the remaining budget. The
+// array has 200000 elements, so expanding it all would allocate far more than
+// the assertion below.
+func TestDirectReadExpandedMessageBudgetBoundsWork(t *testing.T) {
+	const elements = 200000
+
+	cfg := directTestConfig(1, 2*time.Second)
+	cfg.ExpandEventListFromField = "records"
+
+	consumer := newFakeDirectConsumer()
+	consumer.topics["test-topic"] = []int32{0}
+	consumer.partitions["test-topic/0"] = newFakePartitionConsumer()
+
+	outlet := &fakeOutlet{}
+	input := newDirectTestInput(t, cfg, outlet, func(addrs []string, conf *sarama.Config) (directConsumer, error) {
+		return consumer, nil
+	})
+	consumer.addMessages("test-topic", 0, string(largeExpandedMessage(elements)))
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	require.NoError(t, runDirectToCompletion(t, input))
+	runtime.ReadMemStats(&after)
+
+	assert.Equal(t, 1, outlet.count())
+	allocated := after.TotalAlloc - before.TotalAlloc
+	t.Logf("expanding one event from %d elements allocated %d bytes", elements, allocated)
+	assert.True(t, allocated < 32<<20,
+		"expanding one event from %d elements allocated %d bytes", elements, allocated)
 }
 
 func TestDirectReadEmptyTopicTimesOutSuccessfully(t *testing.T) {

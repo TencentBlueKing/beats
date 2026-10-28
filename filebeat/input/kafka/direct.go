@@ -558,9 +558,11 @@ func (input *kafkaInput) dialDirect(
 // runDirectLoop owns the single aggregation outlet, the event budget and the
 // shutdown of all readers. Partition goroutines only read; all expansion and
 // OnEvent calls happen here so one message expanding to many events cannot
-// overshoot max_events. Cleanup is deferred so a panic still closes partition
-// consumers. A consumer error drained after the readers exit wins over a
-// deadline, which would otherwise look like an empty successful preview.
+// overshoot max_events. createEvents receives only the remaining budget, so a
+// huge expanded array is not serialized and materialized beyond it. Cleanup is
+// deferred so a panic still closes partition consumers. A consumer error
+// drained after the readers exit wins over a deadline, which would otherwise
+// look like an empty successful preview.
 func (input *kafkaInput) runDirectLoop(
 	ctx context.Context,
 	consumer directConsumer,
@@ -626,6 +628,7 @@ func (input *kafkaInput) runDirectLoop(
 				message.topic,
 				message.partition,
 				message.message,
+				maxEvents-sent,
 			)
 			for i := range events {
 				if sent >= maxEvents {

@@ -312,7 +312,9 @@ type eventMeta struct {
 
 // createEvents converts a Kafka message into beat events. It is shared by the
 // consumer-group path and the direct-read path; group-specific ACK metadata is
-// attached by the consumer-group caller only.
+// attached by the consumer-group caller only. maxEvents bounds how many events
+// are expanded; 0 keeps the original unlimited consumer-group semantics and the
+// direct-read path passes its remaining event budget.
 func createEvents(
 	version kafka.Version,
 	expandEventListFromField string,
@@ -320,6 +322,7 @@ func createEvents(
 	topic string,
 	partition int32,
 	message *sarama.ConsumerMessage,
+	maxEvents int,
 ) []beat.Event {
 	timestamp := time.Now()
 	kafkaFields := common.MapStr{
@@ -345,7 +348,7 @@ func createEvents(
 	if expandEventListFromField == "" {
 		messages = []string{string(message.Value)}
 	} else {
-		messages = parseMultipleMessages(expandEventListFromField, log, message.Value)
+		messages = parseMultipleMessages(expandEventListFromField, log, message.Value, maxEvents)
 	}
 	events := make([]beat.Event, 0, len(messages))
 	for _, msg := range messages {
@@ -394,6 +397,7 @@ func (h *groupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sara
 			claim.Topic(),
 			claim.Partition(),
 			msg,
+			0, // the consumer-group path keeps expanding every element
 		)
 		for i := range events {
 			// The consumer-group branch keeps the original commit metadata; the
@@ -406,23 +410,35 @@ func (h *groupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sara
 	return nil
 }
 
-// parseMultipleMessages will try to split the message into multiple ones based on the group field provided by the configuration
-func parseMultipleMessages(expandEventListFromField string, log *logp.Logger, bMessage []byte) []string {
+// parseMultipleMessages will try to split the message into multiple ones based on the group field provided by the configuration.
+// maxMessages bounds how many elements are serialized and returned; 0 means unlimited.
+func parseMultipleMessages(
+	expandEventListFromField string,
+	log *logp.Logger,
+	bMessage []byte,
+	maxMessages int,
+) []string {
 	var obj map[string][]interface{}
 	err := json.Unmarshal(bMessage, &obj)
 	if err != nil {
 		log.Errorw(fmt.Sprintf("Kafka desirializing multiple messages using the group object %s", expandEventListFromField), "error", err)
 		return []string{}
 	}
+	values := obj[expandEventListFromField]
+	// The direct-read preview passes its remaining max_events budget so a huge
+	// array is only serialized for the events that can still be delivered. The
+	// consumer-group path passes 0 and keeps the original expand-everything
+	// semantics.
+	if maxMessages > 0 && len(values) > maxMessages {
+		values = values[:maxMessages]
+	}
 	var messages []string
-	if len(obj[expandEventListFromField]) > 0 {
-		for _, ms := range obj[expandEventListFromField] {
-			js, err := json.Marshal(ms)
-			if err == nil {
-				messages = append(messages, string(js))
-			} else {
-				log.Errorw(fmt.Sprintf("Kafka serializing message %s", ms), "error", err)
-			}
+	for _, ms := range values {
+		js, err := json.Marshal(ms)
+		if err == nil {
+			messages = append(messages, string(js))
+		} else {
+			log.Errorw(fmt.Sprintf("Kafka serializing message %s", ms), "error", err)
 		}
 	}
 	return messages
