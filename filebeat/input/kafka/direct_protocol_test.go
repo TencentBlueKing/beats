@@ -1,0 +1,137 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package kafka
+
+import (
+	"testing"
+	"time"
+
+	"github.com/Shopify/sarama"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/elastic/beats/libbeat/common/kafka"
+)
+
+// newMetadataMockBroker starts a MockBroker that answers metadata requests
+// from response. The direct-read tests use it to assert the exact wire fields
+// Sarama sends, which a fake consumer cannot observe.
+func newMetadataMockBroker(t *testing.T, response *sarama.MockMetadataResponse) *sarama.MockBroker {
+	t.Helper()
+	broker := sarama.NewMockBroker(t, 1)
+	response.SetBroker(broker.Addr(), broker.BrokerID())
+	broker.SetHandlerByMap(map[string]sarama.MockResponse{
+		"MetadataRequest": response,
+	})
+	return broker
+}
+
+// TestDirectReadMetadataDisablesTopicAutoCreation is the protocol-level guard
+// for the read-only preview guarantee: when the configured topic is missing
+// from Sarama's metadata cache, the direct branch refreshes it with a
+// topic-scoped MetadataRequest that must not allow topic auto-creation. The
+// topic-scoped request is captured from the MockBroker wire history, not from
+// a fake consumer.
+func TestDirectReadMetadataDisablesTopicAutoCreation(t *testing.T) {
+	response := sarama.NewMockMetadataResponse(t).
+		SetLeader("existing-topic", 0, 1)
+	broker := newMetadataMockBroker(t, response)
+	defer broker.Close()
+
+	cfg := directTestConfig(1, 2*time.Second)
+	cfg.Hosts = []string{broker.Addr()}
+	cfg.Topics = []string{"missing-preview-topic"}
+
+	input := newDirectTestInput(t, cfg, &fakeOutlet{}, nil)
+	err := runDirectToCompletion(t, input)
+	require.Error(t, err)
+	// A missing topic must fail clearly instead of silently returning an empty
+	// preview.
+	assert.Contains(t, err.Error(), "missing-preview-topic")
+	assert.Contains(t, err.Error(), "does not exist")
+
+	topicRequests := 0
+	for _, exchange := range broker.History() {
+		request, ok := exchange.Request.(*sarama.MetadataRequest)
+		if !ok || len(request.Topics) == 0 {
+			continue
+		}
+		topicRequests++
+		for _, topic := range request.Topics {
+			assert.Equal(t, "missing-preview-topic", topic)
+		}
+		// Only MetadataRequest v4+ can encode the flag; a lower version would
+		// make the decoded false meaningless.
+		assert.True(t, request.Version >= 4,
+			"metadata request v%d cannot carry the auto-creation flag", request.Version)
+		assert.False(t, request.AllowAutoTopicCreation,
+			"topic-scoped metadata request %d for %v must not allow auto topic creation",
+			topicRequests, request.Topics)
+	}
+	assert.True(t, topicRequests > 0,
+		"the missing topic must be refreshed with a topic-scoped metadata request")
+}
+
+// TestDirectAutoTopicCreationConfigDefaults proves the new Sarama option keeps
+// the consumer-group path unchanged and only the direct preview opts out.
+func TestDirectAutoTopicCreationConfigDefaults(t *testing.T) {
+	assert.True(t, sarama.NewConfig().Metadata.AllowAutoTopicCreation,
+		"sarama must keep allowing topic auto-creation by default")
+
+	cfg := sarama.NewConfig()
+	cfg.Version = sarama.V1_0_0_0
+	require.NoError(t, applyDirectLimits(cfg, time.Second))
+	assert.False(t, cfg.Metadata.AllowAutoTopicCreation,
+		"the direct preview must not allow topic auto-creation")
+
+	groupConfig, err := newSaramaConfig(defaultConfig())
+	require.NoError(t, err)
+	assert.True(t, groupConfig.Metadata.AllowAutoTopicCreation,
+		"the consumer-group path must keep the sarama default")
+}
+
+// TestDirectReadRejectsKafkaBefore011 documents the fallback for brokers whose
+// MetadataRequest version predates the auto-creation flag: the preview is
+// rejected before connecting instead of sending a request that could create a
+// topic.
+func TestDirectReadRejectsKafkaBefore011(t *testing.T) {
+	cfg := directTestConfig(1, time.Second)
+	cfg.Version = kafka.Version("0.10.0.0")
+
+	connected := false
+	input := newDirectTestInput(t, cfg, &fakeOutlet{}, func(addrs []string, conf *sarama.Config) (directConsumer, error) {
+		connected = true
+		return newFakeDirectConsumer(), nil
+	})
+
+	err := runDirectToCompletion(t, input)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "0.11.0")
+	assert.Contains(t, err.Error(), "automatic topic creation")
+	assert.False(t, connected, "an unsupported version must be rejected before connecting")
+}
+
+func TestApplyDirectLimitsRejectsOldKafkaVersion(t *testing.T) {
+	cfg := sarama.NewConfig()
+	cfg.Version = sarama.V0_10_2_1
+
+	err := applyDirectLimits(cfg, time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "0.11.0")
+	assert.Contains(t, err.Error(), "automatic topic creation")
+}

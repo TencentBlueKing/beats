@@ -536,6 +536,7 @@ func TestCompletionUnsupportedForConsumerGroup(t *testing.T) {
 
 func TestApplyDirectLimitsClampsFetchDefault(t *testing.T) {
 	cfg := sarama.NewConfig()
+	cfg.Version = sarama.V1_0_0_0
 	cfg.Consumer.Fetch.Default = 8 << 20
 	require.NoError(t, applyDirectLimits(cfg, 10*time.Second))
 	assert.Equal(t, int32(directFetchMaxBytes), cfg.Consumer.Fetch.Max)

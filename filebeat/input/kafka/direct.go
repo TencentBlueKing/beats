@@ -143,6 +143,19 @@ func (input *kafkaInput) consumeDirect() error {
 // bounded-read limits are changed; TLS, SASL, version and consumer parameters
 // shared with the consumer-group path are left untouched.
 func applyDirectLimits(cfg *sarama.Config, timeout time.Duration) error {
+	// A preview of a misspelled or deleted topic must stay read-only. Sarama
+	// refreshes the metadata of a topic that is missing from its cache, and
+	// before MetadataRequest v4 that request cannot carry the "do not
+	// auto-create" flag. Refuse the preview instead of risking a topic being
+	// created by a read-only request.
+	if !cfg.Version.IsAtLeast(sarama.V0_11_0_0) {
+		return fmt.Errorf(
+			"direct read requires kafka version 0.11.0 or newer, got %s: "+
+				"older metadata requests cannot disable automatic topic creation",
+			cfg.Version)
+	}
+	cfg.Metadata.AllowAutoTopicCreation = false
+
 	cfg.ChannelBufferSize = directChannelBufferSize
 	cfg.Consumer.Fetch.Max = directFetchMaxBytes
 
