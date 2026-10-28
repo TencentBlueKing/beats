@@ -18,6 +18,7 @@
 package kafka
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -268,6 +269,186 @@ func waitForOffsetRequest(broker *sarama.MockBroker, timeout time.Duration) bool
 	return false
 }
 
+// directConsumerTracker is a test-only seam around the direct consumer factory.
+// It records every partition consumer the preview receives from
+// ConsumePartition and every shutdown it performs on them, so the cancellation
+// test can assert the cleanup contract and not only the completion timing. The
+// factory mirrors the production one (a real Sarama client and consumer); only
+// the returned consumers are wrapped.
+//
+// The factory also subscribes to one partition up front and hands that real
+// partition consumer to the matching ConsumePartition call. Sarama resolves a
+// partition's starting offset with two serialized broker round trips, so with a
+// slow mock broker the first worker-created partition consumer can take several
+// seconds to appear. The pre-created one makes the cleanup assertion
+// deterministic while the remaining subscriptions are still queued when the
+// test cancels.
+type directConsumerTracker struct {
+	mu sync.Mutex
+
+	precreateTopic     string
+	precreatePartition int32
+	precreated         sarama.PartitionConsumer
+	precreatedTaken    bool
+
+	partitionConsumers []*trackedPartitionConsumer
+	asyncCloses        int
+	closeCalls         int
+}
+
+func newDirectConsumerTracker(topic string, partition int32) *directConsumerTracker {
+	return &directConsumerTracker{
+		precreateTopic:     topic,
+		precreatePartition: partition,
+	}
+}
+
+type trackedDirectConsumer struct {
+	directConsumer
+	tracker *directConsumerTracker
+}
+
+func (t *directConsumerTracker) factory(
+	addrs []string,
+	conf *sarama.Config,
+) (directConsumer, error) {
+	client, err := sarama.NewClient(addrs, conf)
+	if err != nil {
+		return nil, err
+	}
+	consumer, err := sarama.NewConsumerFromClient(client)
+	if err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	pc, err := consumer.ConsumePartition(t.precreateTopic, t.precreatePartition, sarama.OffsetNewest)
+	if err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	t.mu.Lock()
+	t.precreated = pc
+	t.mu.Unlock()
+	return &trackedDirectConsumer{
+		directConsumer: &saramaDirectConsumer{client: client, consumer: consumer},
+		tracker:        t,
+	}, nil
+}
+
+func (c *trackedDirectConsumer) ConsumePartition(
+	topic string,
+	partition int32,
+	offset int64,
+) (sarama.PartitionConsumer, error) {
+	if pc := c.takePrecreated(topic, partition); pc != nil {
+		return c.track(topic, partition, pc), nil
+	}
+	pc, err := c.directConsumer.ConsumePartition(topic, partition, offset)
+	if err != nil {
+		return nil, err
+	}
+	return c.track(topic, partition, pc), nil
+}
+
+// takePrecreated hands the pre-subscribed partition consumer to its matching
+// ConsumePartition call exactly once.
+func (c *trackedDirectConsumer) takePrecreated(topic string, partition int32) sarama.PartitionConsumer {
+	c.tracker.mu.Lock()
+	defer c.tracker.mu.Unlock()
+	if c.tracker.precreatedTaken ||
+		topic != c.tracker.precreateTopic ||
+		partition != c.tracker.precreatePartition {
+		return nil
+	}
+	c.tracker.precreatedTaken = true
+	pc := c.tracker.precreated
+	c.tracker.precreated = nil
+	return pc
+}
+
+func (c *trackedDirectConsumer) track(
+	topic string,
+	partition int32,
+	pc sarama.PartitionConsumer,
+) sarama.PartitionConsumer {
+	tracked := &trackedPartitionConsumer{
+		PartitionConsumer: pc,
+		tracker:           c.tracker,
+		topic:             topic,
+		partition:         partition,
+	}
+	c.tracker.mu.Lock()
+	c.tracker.partitionConsumers = append(c.tracker.partitionConsumers, tracked)
+	c.tracker.mu.Unlock()
+	return tracked
+}
+
+func (c *trackedDirectConsumer) Close() error {
+	c.tracker.mu.Lock()
+	c.tracker.closeCalls++
+	pending := c.tracker.precreated
+	c.tracker.precreated = nil
+	c.tracker.precreatedTaken = true
+	c.tracker.mu.Unlock()
+	if pending != nil {
+		pending.AsyncClose()
+	}
+	return c.directConsumer.Close()
+}
+
+// Abort keeps the deadline/cancel interruption identical to production: the
+// direct consumer aborts the broker connections before it is closed.
+func (c *trackedDirectConsumer) Abort() {
+	if aborter, ok := c.directConsumer.(directConsumerAborter); ok {
+		aborter.Abort()
+	}
+}
+
+type trackedPartitionConsumer struct {
+	sarama.PartitionConsumer
+
+	tracker   *directConsumerTracker
+	topic     string
+	partition int32
+
+	asyncCloseCalls int
+}
+
+func (p *trackedPartitionConsumer) AsyncClose() {
+	p.tracker.mu.Lock()
+	p.asyncCloseCalls++
+	p.tracker.asyncCloses++
+	p.tracker.mu.Unlock()
+	p.PartitionConsumer.AsyncClose()
+}
+
+func (p *trackedPartitionConsumer) asyncCloseCount() int {
+	p.tracker.mu.Lock()
+	defer p.tracker.mu.Unlock()
+	return p.asyncCloseCalls
+}
+
+func (t *directConsumerTracker) waitForPartitionConsumer(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		t.mu.Lock()
+		created := len(t.partitionConsumers)
+		t.mu.Unlock()
+		if created > 0 {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+func (t *directConsumerTracker) snapshot() ([]*trackedPartitionConsumer, int, int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	partitions := append([]*trackedPartitionConsumer(nil), t.partitionConsumers...)
+	return partitions, t.asyncCloses, t.closeCalls
+}
+
 // TestDirectReadDeadlineInterruptsQueuedSubscriptions reproduces the wide
 // partition, slow broker case: 64 partitions with 100ms per response would
 // keep the subscription busy for about 6.4s. The 1s preview deadline must
@@ -289,14 +470,16 @@ func TestDirectReadDeadlineInterruptsQueuedSubscriptions(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "timed out")
-	assert.True(t, elapsed < 4*time.Second,
+	assert.True(t, elapsed < 2*time.Second,
 		"64 queued offset requests at 100ms would take 6.4s; the preview returned after %s", elapsed)
 }
 
 // TestDirectReadCancellationInterruptsQueuedSubscriptions checks the same
 // interruption on an explicit cancel instead of the deadline. The preview
 // timeout is far away, so only the cancellation can end the queued
-// subscription calls.
+// subscription calls. The tracker factory pre-subscribes one partition so a
+// real partition consumer exists when the cancel fires, while every other
+// subscription is still queued behind the slow broker.
 func TestDirectReadCancellationInterruptsQueuedSubscriptions(t *testing.T) {
 	const partitions = 64
 	broker := newSlowWideBroker(t, "wide-topic", partitions, 100*time.Millisecond)
@@ -306,10 +489,16 @@ func TestDirectReadCancellationInterruptsQueuedSubscriptions(t *testing.T) {
 	cfg.Hosts = []string{broker.Addr()}
 	cfg.Topics = []string{"wide-topic"}
 
-	input := newDirectTestInput(t, cfg, &fakeOutlet{}, nil)
+	tracker := newDirectConsumerTracker("wide-topic", 0)
+	input := newDirectTestInput(t, cfg, &fakeOutlet{}, tracker.factory)
 	input.Run()
 	require.True(t, waitForOffsetRequest(broker, 2*time.Second),
 		"the slow broker never received an offset request")
+	// The pre-subscribed partition consumer must be handed to the preview before
+	// cancelling; the remaining partitions are still queued behind the slow
+	// broker. This only bounds the setup; the latency assertion is below.
+	require.True(t, tracker.waitForPartitionConsumer(2*time.Second),
+		"the pre-created partition consumer was not handed to the preview before cancellation")
 
 	cancelStart := time.Now()
 	close(input.context.Done)
@@ -321,5 +510,21 @@ func TestDirectReadCancellationInterruptsQueuedSubscriptions(t *testing.T) {
 	elapsed := time.Since(cancelStart)
 	require.Error(t, input.CompletionErr())
 	assert.Contains(t, input.CompletionErr().Error(), "canceled")
-	assert.True(t, elapsed < 3*time.Second, "cancellation took %s", elapsed)
+	assert.True(t, elapsed < 2*time.Second, "cancellation took %s, want less than 2s", elapsed)
+
+	// The in-flight subscriptions are abandoned by the cancellation, so their
+	// partition consumers must be shut down and the direct consumer closed
+	// exactly once. Without these assertions a regression could leak every
+	// partition consumer while the test still only measured the runtime.
+	createdPartitions, asyncCloses, closeCalls := tracker.snapshot()
+	require.NotEmpty(t, createdPartitions,
+		"cancellation must be asserted against at least one created partition consumer")
+	for _, partition := range createdPartitions {
+		assert.Equal(t, 1, partition.asyncCloseCount(),
+			"partition consumer %s/%d must be AsyncClosed exactly once",
+			partition.topic, partition.partition)
+	}
+	assert.Equal(t, len(createdPartitions), asyncCloses,
+		"every created partition consumer must be AsyncClosed")
+	assert.Equal(t, 1, closeCalls, "directConsumer.Close must be called exactly once")
 }
