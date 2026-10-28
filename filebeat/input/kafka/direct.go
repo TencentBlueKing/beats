@@ -61,7 +61,70 @@ type directConsumer interface {
 	Close() error
 }
 
+// directConsumerAborter is implemented by the production Sarama consumer
+// wrapper. Closing a Sarama client is graceful and drains queued responses
+// first, so a slow broker can delay it behind the whole request backlog;
+// aborting the broker connections makes the blocked requests fail at once.
+type directConsumerAborter interface {
+	Abort()
+}
+
+// saramaDirectConsumer keeps the Sarama client next to its consumer so the
+// direct preview can abort broker connections when its deadline expires.
+type saramaDirectConsumer struct {
+	client   sarama.Client
+	consumer sarama.Consumer
+}
+
+func (c *saramaDirectConsumer) Partitions(topic string) ([]int32, error) {
+	return c.consumer.Partitions(topic)
+}
+
+func (c *saramaDirectConsumer) ConsumePartition(
+	topic string,
+	partition int32,
+	offset int64,
+) (sarama.PartitionConsumer, error) {
+	return c.consumer.ConsumePartition(topic, partition, offset)
+}
+
+// Close closes the client. The consumer returned by NewConsumerFromClient does
+// not own the client and its Close is a no-op for it.
+func (c *saramaDirectConsumer) Close() error {
+	return c.client.Close()
+}
+
+func (c *saramaDirectConsumer) Abort() {
+	if aborter, ok := c.client.(interface{ Abort() }); ok {
+		aborter.Abort()
+	}
+}
+
 type directConsumerFactory func(addrs []string, conf *sarama.Config) (directConsumer, error)
+
+// directConsumerCloser makes Close idempotent. The subscription goroutine and
+// its caller can both need to close the consumer: the caller when it waited
+// for the subscription, the goroutine when the cleanup budget expired first.
+type directConsumerCloser struct {
+	directConsumer
+	once sync.Once
+	err  error
+}
+
+func newDirectConsumerCloser(consumer directConsumer) *directConsumerCloser {
+	return &directConsumerCloser{directConsumer: consumer}
+}
+
+func (c *directConsumerCloser) Close() error {
+	c.once.Do(func() { c.err = c.directConsumer.Close() })
+	return c.err
+}
+
+func (c *directConsumerCloser) Abort() {
+	if aborter, ok := c.directConsumer.(directConsumerAborter); ok {
+		aborter.Abort()
+	}
+}
 
 type directPartition struct {
 	topic     string
@@ -112,7 +175,16 @@ func (input *kafkaInput) consumeDirect() error {
 	factory := input.directConsumerFactory
 	if factory == nil {
 		factory = func(addrs []string, conf *sarama.Config) (directConsumer, error) {
-			return sarama.NewConsumer(addrs, conf)
+			client, err := sarama.NewClient(addrs, conf)
+			if err != nil {
+				return nil, err
+			}
+			consumer, err := sarama.NewConsumerFromClient(client)
+			if err != nil {
+				_ = client.Close()
+				return nil, err
+			}
+			return &saramaDirectConsumer{client: client, consumer: consumer}, nil
 		}
 	}
 
@@ -120,11 +192,17 @@ func (input *kafkaInput) consumeDirect() error {
 	if err != nil {
 		return err
 	}
+	consumer = newDirectConsumerCloser(consumer)
 
 	partitions, err := input.subscribeDirect(ctx, deadline, consumer)
 	if err != nil {
+		if isDirectAbort(err) {
+			// subscribeDirect already aborted the broker connections and closed
+			// every partition consumer and the client within its bounded budget.
+			return err
+		}
 		input.closeDirectPartitions(partitions)
-		_ = consumer.Close()
+		_ = closeDirectConsumer(consumer)
 		return err
 	}
 	// A deadline or cancellation that fired before the subscription was fully
@@ -132,7 +210,7 @@ func (input *kafkaInput) consumeDirect() error {
 	// to return successfully.
 	if err := ctx.Err(); err != nil {
 		input.closeDirectPartitions(partitions)
-		_ = consumer.Close()
+		_ = closeDirectConsumer(consumer)
 		return directAbortError(ctx, deadline, "before subscribing to kafka partitions")
 	}
 
@@ -246,11 +324,97 @@ func (input *kafkaInput) connectDirect(
 	return nil, fmt.Errorf("direct read: connecting to kafka: %w", lastErr)
 }
 
+// directSubscription is the result of the resolve+subscribe phase. The result
+// channel is buffered so the subscription goroutine can always deliver its
+// result, even when the deadline path has already stopped waiting for it.
+type directSubscription struct {
+	partitions []*directPartition
+	err        error
+}
+
 // subscribeDirect resolves partitions and creates one partition consumer per
-// partition. Reaching the deadline during this phase is a failure: a preview
-// that never established a healthy subscription must not look like an empty
-// topic.
+// partition within the preview deadline. Reaching the deadline during this
+// phase is a failure: a preview that never established a healthy subscription
+// must not look like an empty topic.
+//
+// consumer.Partitions and consumer.ConsumePartition are synchronous Sarama
+// calls without a context, so a worker only notices the deadline before it
+// starts a call. A per-request socket timeout cannot bound the phase either:
+// requests for many partitions queue on the same broker connection. The whole
+// phase therefore runs in a goroutine; on deadline or cancellation the broker
+// sockets are aborted, which makes every in-flight metadata or offset request
+// return at once and rejects any recovery request. The subscription goroutine
+// and the client close are awaited under one bounded budget.
 func (input *kafkaInput) subscribeDirect(
+	ctx context.Context,
+	deadline time.Time,
+	consumer directConsumer,
+) ([]*directPartition, error) {
+	done := make(chan directSubscription, 1)
+	go func() {
+		partitions, err := input.subscribeDirectBlocking(ctx, deadline, consumer)
+		if ctx.Err() == nil {
+			done <- directSubscription{partitions: partitions, err: err}
+			return
+		}
+		// The deadline or cancellation raced the last synchronous call. The
+		// caller cannot receive these partition consumers anymore, so this
+		// goroutine owns their cleanup.
+		input.closeDirectPartitions(partitions)
+		done <- directSubscription{
+			err: directAbortError(ctx, deadline, "while subscribing to kafka partitions"),
+		}
+		// The caller may have stopped waiting when the cleanup budget expired;
+		// make sure the client is still released in that case. Close is
+		// idempotent through directConsumerCloser.
+		_ = closeDirectConsumer(consumer)
+	}()
+
+	select {
+	case result := <-done:
+		if !isDirectAbort(result.err) {
+			return result.partitions, result.err
+		}
+		// The subscription already observed the abort. It only cleans up after
+		// itself when it sees ctx itself, so close anything it returned here.
+		input.closeDirectPartitions(result.partitions)
+		done = nil
+	case <-ctx.Done():
+	}
+
+	// Consumer.Close is graceful: it drains queued responses and can therefore
+	// sit behind a slow broker's whole request backlog. Abort the broker
+	// sockets first so the blocked requests fail immediately; Close then marks
+	// the client closed, which makes every subsequent Sarama call fail fast
+	// instead of trying to recover over new connections.
+	if aborter, ok := consumer.(directConsumerAborter); ok {
+		aborter.Abort()
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- consumer.Close() }()
+
+	timer := time.NewTimer(directReaderShutdownBudget)
+	defer timer.Stop()
+	for done != nil || closeDone != nil {
+		select {
+		case result := <-done:
+			// A successful result can race the cancellation. Abort semantics
+			// win, so its partition consumers are closed here.
+			input.closeDirectPartitions(result.partitions)
+			done = nil
+		case <-closeDone:
+			closeDone = nil
+		case <-timer.C:
+			return nil, directAbortError(ctx, deadline, "while subscribing to kafka partitions")
+		}
+	}
+	return nil, directAbortError(ctx, deadline, "while subscribing to kafka partitions")
+}
+
+// subscribeDirectBlocking is the synchronous resolve+subscribe phase run by
+// subscribeDirect. It returns every partition consumer it created, including on
+// failure, so the caller can close them.
+func (input *kafkaInput) subscribeDirectBlocking(
 	ctx context.Context,
 	deadline time.Time,
 	consumer directConsumer,
@@ -651,9 +815,24 @@ func consumerMessageSize(message *sarama.ConsumerMessage) int {
 	return size
 }
 
+// directAbort marks an error caused by the preview deadline or an external
+// cancellation, as opposed to a broker, topic or configuration failure. The
+// subscription cleanup path checks it to know that it already interrupted the
+// consumer.
+type directAbort struct {
+	message string
+}
+
+func (e *directAbort) Error() string { return e.message }
+
+func isDirectAbort(err error) bool {
+	var abort *directAbort
+	return errors.As(err, &abort)
+}
+
 func directAbortError(ctx context.Context, deadline time.Time, stage string) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) || time.Now().After(deadline) {
-		return fmt.Errorf("direct read: timed out %s", stage)
+		return &directAbort{message: fmt.Sprintf("direct read: timed out %s", stage)}
 	}
-	return fmt.Errorf("direct read: canceled %s", stage)
+	return &directAbort{message: fmt.Sprintf("direct read: canceled %s", stage)}
 }

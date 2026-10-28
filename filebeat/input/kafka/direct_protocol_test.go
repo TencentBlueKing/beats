@@ -135,3 +135,104 @@ func TestApplyDirectLimitsRejectsOldKafkaVersion(t *testing.T) {
 	assert.Contains(t, err.Error(), "0.11.0")
 	assert.Contains(t, err.Error(), "automatic topic creation")
 }
+
+// newSlowWideBroker starts a MockBroker serving one topic with partitionCount
+// partitions and delays every response by latency. The delayed metadata and
+// offset responses make the per-partition subscription calls queue on the
+// single broker connection, which is the slow-broker scenario the deadline
+// must interrupt.
+func newSlowWideBroker(
+	t *testing.T,
+	topic string,
+	partitionCount int,
+	latency time.Duration,
+) *sarama.MockBroker {
+	t.Helper()
+	broker := sarama.NewMockBroker(t, 1)
+	metadata := sarama.NewMockMetadataResponse(t)
+	// Kafka 1.0.0 sends OffsetRequest v1, so the mock response must use it too.
+	offsets := sarama.NewMockOffsetResponse(t).SetVersion(1)
+	for partition := 0; partition < partitionCount; partition++ {
+		id := int32(partition)
+		metadata.SetLeader(topic, id, broker.BrokerID())
+		// chooseStartingOffset asks for both ends of every partition.
+		offsets.SetOffset(topic, id, sarama.OffsetNewest, 0)
+		offsets.SetOffset(topic, id, sarama.OffsetOldest, 0)
+	}
+	metadata.SetBroker(broker.Addr(), broker.BrokerID())
+	broker.SetHandlerByMap(map[string]sarama.MockResponse{
+		"MetadataRequest": metadata,
+		"OffsetRequest":   offsets,
+	})
+	broker.SetLatency(latency)
+	return broker
+}
+
+func waitForOffsetRequest(broker *sarama.MockBroker, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, exchange := range broker.History() {
+			if _, ok := exchange.Request.(*sarama.OffsetRequest); ok {
+				return true
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// TestDirectReadDeadlineInterruptsQueuedSubscriptions reproduces the wide
+// partition, slow broker case: 64 partitions with 100ms per response would
+// keep the subscription busy for about 6.4s. The 1s preview deadline must
+// interrupt the queued Sarama requests and return well before that backlog
+// finishes, and the cleanup budget must not be spent waiting for the broker.
+func TestDirectReadDeadlineInterruptsQueuedSubscriptions(t *testing.T) {
+	const partitions = 64
+	broker := newSlowWideBroker(t, "wide-topic", partitions, 100*time.Millisecond)
+	defer broker.Close()
+
+	cfg := directTestConfig(1000, time.Second)
+	cfg.Hosts = []string{broker.Addr()}
+	cfg.Topics = []string{"wide-topic"}
+
+	input := newDirectTestInput(t, cfg, &fakeOutlet{}, nil)
+	start := time.Now()
+	err := runDirectToCompletion(t, input)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timed out")
+	assert.True(t, elapsed < 4*time.Second,
+		"64 queued offset requests at 100ms would take 6.4s; the preview returned after %s", elapsed)
+}
+
+// TestDirectReadCancellationInterruptsQueuedSubscriptions checks the same
+// interruption on an explicit cancel instead of the deadline. The preview
+// timeout is far away, so only the cancellation can end the queued
+// subscription calls.
+func TestDirectReadCancellationInterruptsQueuedSubscriptions(t *testing.T) {
+	const partitions = 64
+	broker := newSlowWideBroker(t, "wide-topic", partitions, 100*time.Millisecond)
+	defer broker.Close()
+
+	cfg := directTestConfig(1000, 30*time.Second)
+	cfg.Hosts = []string{broker.Addr()}
+	cfg.Topics = []string{"wide-topic"}
+
+	input := newDirectTestInput(t, cfg, &fakeOutlet{}, nil)
+	input.Run()
+	require.True(t, waitForOffsetRequest(broker, 2*time.Second),
+		"the slow broker never received an offset request")
+
+	cancelStart := time.Now()
+	close(input.context.Done)
+	select {
+	case <-input.completion:
+	case <-time.After(4 * time.Second):
+		t.Fatal("direct read did not complete after cancellation")
+	}
+	elapsed := time.Since(cancelStart)
+	require.Error(t, input.CompletionErr())
+	assert.Contains(t, input.CompletionErr().Error(), "canceled")
+	assert.True(t, elapsed < 3*time.Second, "cancellation took %s", elapsed)
+}
