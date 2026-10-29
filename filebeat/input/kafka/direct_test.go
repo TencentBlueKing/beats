@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -94,11 +95,15 @@ type fakeDirectConsumer struct {
 
 	partitionsErr error
 
-	mu        sync.Mutex
-	offsets   []int64
-	consumed  int
-	closeCall int
-	closeErr  error
+	mu              sync.Mutex
+	offsets         []int64
+	consumed        int
+	closeCall       int
+	closeErr        error
+	refreshCalls    int
+	topicsCalls     int
+	partitionsCalls int
+	callSequence    []string
 }
 
 func newFakeDirectConsumer() *fakeDirectConsumer {
@@ -108,7 +113,35 @@ func newFakeDirectConsumer() *fakeDirectConsumer {
 	}
 }
 
+// RefreshMetadata and Topics are the stock-API preflight seam: the direct
+// branch must refresh the full metadata snapshot and list the known topics
+// before it resolves partitions or subscribes.
+func (c *fakeDirectConsumer) RefreshMetadata() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.refreshCalls++
+	c.callSequence = append(c.callSequence, "refresh_metadata")
+	return nil
+}
+
+func (c *fakeDirectConsumer) Topics() ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.topicsCalls++
+	c.callSequence = append(c.callSequence, "topics")
+	topics := make([]string, 0, len(c.topics))
+	for topic := range c.topics {
+		topics = append(topics, topic)
+	}
+	sort.Strings(topics)
+	return topics, nil
+}
+
 func (c *fakeDirectConsumer) Partitions(topic string) ([]int32, error) {
+	c.mu.Lock()
+	c.partitionsCalls++
+	c.callSequence = append(c.callSequence, "partitions:"+topic)
+	c.mu.Unlock()
 	if c.partitionsErr != nil {
 		return nil, c.partitionsErr
 	}
@@ -123,6 +156,7 @@ func (c *fakeDirectConsumer) ConsumePartition(topic string, partition int32, off
 	key := fmt.Sprintf("%s/%d", topic, partition)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.callSequence = append(c.callSequence, fmt.Sprintf("consume:%s/%d", topic, partition))
 	pc, ok := c.partitions[key]
 	if !ok || pc == nil {
 		pc = newFakePartitionConsumer()
@@ -410,6 +444,12 @@ type slowSubscribeConsumer struct {
 	calls     int
 }
 
+func (c *slowSubscribeConsumer) RefreshMetadata() error { return nil }
+
+func (c *slowSubscribeConsumer) Topics() ([]string, error) {
+	return []string{"wide-topic"}, nil
+}
+
 func (c *slowSubscribeConsumer) Partitions(string) ([]int32, error) {
 	return append([]int32(nil), c.partitions...), nil
 }
@@ -674,6 +714,120 @@ func TestDirectReadBlockedOutletTimesOut(t *testing.T) {
 		"blocked outlet abort took %s, want less than 1s", time.Since(start))
 }
 
+// TestDirectReadMissingTopicFailsBeforePartitions covers the typo and deleted
+// topic scenarios: a topic absent from the refreshed metadata must fail with
+// an explicit error before any partition or subscription call. Those calls are
+// what make stock Sarama send a topic-scoped metadata request, which can
+// auto-create the topic on Kafka 1.0+.
+func TestDirectReadMissingTopicFailsBeforePartitions(t *testing.T) {
+	cfg := directTestConfig(1, time.Second)
+
+	consumer := newFakeDirectConsumer()
+	consumer.topics["existing-topic"] = []int32{0}
+
+	input := newDirectTestInput(t, cfg, &fakeOutlet{}, func(addrs []string, conf *sarama.Config) (directConsumer, error) {
+		return consumer, nil
+	})
+
+	err := runDirectToCompletion(t, input)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `topic "test-topic" does not exist`)
+
+	consumer.mu.Lock()
+	refreshCalls, topicsCalls := consumer.refreshCalls, consumer.topicsCalls
+	partitionsCalls, consumed := consumer.partitionsCalls, consumer.consumed
+	closeCalls := consumer.closeCall
+	consumer.mu.Unlock()
+
+	assert.Equal(t, 1, refreshCalls, "the preflight must refresh metadata once")
+	assert.Equal(t, 1, topicsCalls, "the preflight must list topics once")
+	assert.Equal(t, 0, partitionsCalls, "a missing topic must never reach Partitions")
+	assert.Equal(t, 0, consumed, "a missing topic must never be subscribed")
+	assert.Equal(t, 1, closeCalls, "the failed preview must still close the consumer")
+}
+
+// TestDirectReadPreflightBeforePartitions pins the order of the read-only
+// preflight: refresh the full metadata snapshot, list the known topics, then
+// resolve partitions and subscribe.
+func TestDirectReadPreflightBeforePartitions(t *testing.T) {
+	cfg := directTestConfig(10, 50*time.Millisecond)
+
+	consumer := newFakeDirectConsumer()
+	consumer.topics["test-topic"] = []int32{0}
+	consumer.partitions["test-topic/0"] = newFakePartitionConsumer()
+
+	input := newDirectTestInput(t, cfg, &fakeOutlet{}, func(addrs []string, conf *sarama.Config) (directConsumer, error) {
+		return consumer, nil
+	})
+
+	require.NoError(t, runDirectToCompletion(t, input))
+
+	consumer.mu.Lock()
+	calls := append([]string(nil), consumer.callSequence...)
+	consumer.mu.Unlock()
+	require.True(t, len(calls) >= 4, "preview made %d calls, want at least 4", len(calls))
+	assert.Equal(t, "refresh_metadata", calls[0])
+	assert.Equal(t, "topics", calls[1])
+	assert.Equal(t, "partitions:test-topic", calls[2])
+	assert.Equal(t, "consume:test-topic/0", calls[3])
+}
+
+// TestDirectReadAbortReturnsBeforeLateCleanup checks the deadline boundary: the
+// caller and Stop() must return at the deadline even though every synchronous
+// Sarama call and the consumer close still block. The subscription goroutine
+// owns that late cleanup and closes the partition consumers and the consumer
+// exactly once afterwards.
+func TestDirectReadAbortReturnsBeforeLateCleanup(t *testing.T) {
+	const partitions = 4
+
+	cfg := directTestConfig(10, 100*time.Millisecond)
+	consumer := newSlowCleanupConsumer(partitions)
+	input := newDirectTestInput(t, cfg, &fakeOutlet{}, func(addrs []string, conf *sarama.Config) (directConsumer, error) {
+		return consumer, nil
+	})
+
+	input.Run()
+	require.True(t, consumer.waitForConsumeStart(2*time.Second),
+		"the subscription workers never reached ConsumePartition")
+
+	stopStart := time.Now()
+	input.Stop()
+	elapsed := time.Since(stopStart)
+
+	err := input.CompletionErr()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timed out while subscribing")
+	assert.True(t, elapsed < time.Second, "Stop took %s, want less than 1s", elapsed)
+
+	// The deadline returned while every ConsumePartition call and the consumer
+	// close were still blocked: the cleanup belongs to the subscription
+	// goroutine and has not run yet.
+	created, started, closeCalls := consumer.snapshot()
+	assert.Equal(t, partitions, created)
+	assert.Equal(t, partitions, started)
+	assert.Equal(t, 0, closeCalls, "late cleanup must not run before the queued calls return")
+
+	close(consumer.releaseConsume)
+	require.True(t, consumer.waitForCloseStart(2*time.Second),
+		"the late cleanup never closed the consumer")
+	close(consumer.releaseClose)
+	select {
+	case <-consumer.cleanupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late cleanup did not finish")
+	}
+
+	for _, pc := range consumer.partitionConsumers() {
+		select {
+		case <-pc.closed:
+		case <-time.After(time.Second):
+			t.Fatal("a late partition consumer was not closed")
+		}
+	}
+	_, _, closeCalls = consumer.snapshot()
+	assert.Equal(t, 1, closeCalls, "the late cleanup must close the consumer exactly once")
+}
+
 func TestDirectReadPanicCompletes(t *testing.T) {
 	cfg := directTestConfig(1, time.Second)
 	consumer := newFakeDirectConsumer()
@@ -728,6 +882,126 @@ func (o *blockingOutlet) OnEvent(*util.Data) bool {
 }
 func (o *blockingOutlet) Close() error          { return nil }
 func (o *blockingOutlet) Done() <-chan struct{} { return nil }
+
+// slowCleanupConsumer is a broker whose synchronous ConsumePartition calls are
+// still queued when the preview deadline fires and whose Close is slower than
+// the deadline. The test uses it to assert that the caller does not wait for
+// either, and that the subscription goroutine closes the late partition
+// consumers and the consumer exactly once.
+type slowCleanupConsumer struct {
+	partitions []int32
+
+	releaseConsume chan struct{}
+	consumeStarted chan struct{}
+	closeStarted   chan struct{}
+	releaseClose   chan struct{}
+	cleanupDone    chan struct{}
+
+	consumeOnce sync.Once
+	closeOnce   sync.Once
+	doneOnce    sync.Once
+
+	mu           sync.Mutex
+	created      []*fakePartitionConsumer
+	started      int
+	refreshCalls int
+	topicsCalls  int
+	closeCalls   int
+}
+
+func newSlowCleanupConsumer(partitionCount int) *slowCleanupConsumer {
+	consumer := &slowCleanupConsumer{
+		partitions:     make([]int32, partitionCount),
+		releaseConsume: make(chan struct{}),
+		consumeStarted: make(chan struct{}),
+		closeStarted:   make(chan struct{}),
+		releaseClose:   make(chan struct{}),
+		cleanupDone:    make(chan struct{}),
+	}
+	for i := range consumer.partitions {
+		consumer.partitions[i] = int32(i)
+	}
+	return consumer
+}
+
+func (c *slowCleanupConsumer) RefreshMetadata() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.refreshCalls++
+	return nil
+}
+
+func (c *slowCleanupConsumer) Topics() ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.topicsCalls++
+	return []string{"test-topic"}, nil
+}
+
+func (c *slowCleanupConsumer) Partitions(string) ([]int32, error) {
+	return append([]int32(nil), c.partitions...), nil
+}
+
+func (c *slowCleanupConsumer) ConsumePartition(string, int32, int64) (sarama.PartitionConsumer, error) {
+	pc := newFakePartitionConsumer()
+	c.mu.Lock()
+	c.created = append(c.created, pc)
+	c.started++
+	c.mu.Unlock()
+	c.consumeOnce.Do(func() { close(c.consumeStarted) })
+	<-c.releaseConsume
+	return pc, nil
+}
+
+func (c *slowCleanupConsumer) Close() error {
+	c.mu.Lock()
+	c.closeCalls++
+	c.mu.Unlock()
+	c.closeOnce.Do(func() { close(c.closeStarted) })
+	<-c.releaseClose
+	c.doneOnce.Do(func() { close(c.cleanupDone) })
+	return nil
+}
+
+func (c *slowCleanupConsumer) partitionConsumers() []*fakePartitionConsumer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]*fakePartitionConsumer(nil), c.created...)
+}
+
+func (c *slowCleanupConsumer) snapshot() (created, started, closeCalls int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.created), c.started, c.closeCalls
+}
+
+func (c *slowCleanupConsumer) waitForConsumeStart(timeout time.Duration) bool {
+	return waitForCondition(timeout, func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.started == len(c.partitions)
+	})
+}
+
+func (c *slowCleanupConsumer) waitForCloseStart(timeout time.Duration) bool {
+	return waitForCondition(timeout, func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.closeCalls == 1
+	})
+}
+
+// waitForCondition polls cond until it is true or the timeout expires.
+func waitForCondition(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return cond()
+}
 
 type panicOutlet struct{}
 

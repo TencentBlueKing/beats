@@ -54,26 +54,33 @@ const (
 )
 
 // directConsumer is the narrow Sarama consumer surface used by the direct
-// branch. It is intentionally small so unit tests do not need a real broker.
+// branch. It is intentionally small so unit tests do not need a real broker,
+// and it only uses stock Sarama APIs: RefreshMetadata and Topics come straight
+// from sarama.Client. No vendored Sarama field, flag or method is required.
 type directConsumer interface {
+	RefreshMetadata() error
+	Topics() ([]string, error)
 	Partitions(topic string) ([]int32, error)
 	ConsumePartition(topic string, partition int32, offset int64) (sarama.PartitionConsumer, error)
 	Close() error
 }
 
-// directConsumerAborter is implemented by the production Sarama consumer
-// wrapper. Closing a Sarama client is graceful and drains queued responses
-// first, so a slow broker can delay it behind the whole request backlog;
-// aborting the broker connections makes the blocked requests fail at once.
-type directConsumerAborter interface {
-	Abort()
-}
-
-// saramaDirectConsumer keeps the Sarama client next to its consumer so the
-// direct preview can abort broker connections when its deadline expires.
+// saramaDirectConsumer keeps the Sarama client next to its consumer. The
+// consumer returned by NewConsumerFromClient does not own the client, so Close
+// closes the client.
 type saramaDirectConsumer struct {
 	client   sarama.Client
 	consumer sarama.Consumer
+}
+
+func (c *saramaDirectConsumer) RefreshMetadata() error {
+	// No topic arguments: this is a full refresh, which stock Sarama always
+	// encodes with auto topic creation disabled.
+	return c.client.RefreshMetadata()
+}
+
+func (c *saramaDirectConsumer) Topics() ([]string, error) {
+	return c.client.Topics()
 }
 
 func (c *saramaDirectConsumer) Partitions(topic string) ([]int32, error) {
@@ -88,43 +95,11 @@ func (c *saramaDirectConsumer) ConsumePartition(
 	return c.consumer.ConsumePartition(topic, partition, offset)
 }
 
-// Close closes the client. The consumer returned by NewConsumerFromClient does
-// not own the client and its Close is a no-op for it.
 func (c *saramaDirectConsumer) Close() error {
 	return c.client.Close()
 }
 
-func (c *saramaDirectConsumer) Abort() {
-	if aborter, ok := c.client.(interface{ Abort() }); ok {
-		aborter.Abort()
-	}
-}
-
 type directConsumerFactory func(addrs []string, conf *sarama.Config) (directConsumer, error)
-
-// directConsumerCloser makes Close idempotent. The subscription goroutine and
-// its caller can both need to close the consumer: the caller when it waited
-// for the subscription, the goroutine when the cleanup budget expired first.
-type directConsumerCloser struct {
-	directConsumer
-	once sync.Once
-	err  error
-}
-
-func newDirectConsumerCloser(consumer directConsumer) *directConsumerCloser {
-	return &directConsumerCloser{directConsumer: consumer}
-}
-
-func (c *directConsumerCloser) Close() error {
-	c.once.Do(func() { c.err = c.directConsumer.Close() })
-	return c.err
-}
-
-func (c *directConsumerCloser) Abort() {
-	if aborter, ok := c.directConsumer.(directConsumerAborter); ok {
-		aborter.Abort()
-	}
-}
 
 type directPartition struct {
 	topic     string
@@ -192,26 +167,19 @@ func (input *kafkaInput) consumeDirect() error {
 	if err != nil {
 		return err
 	}
-	consumer = newDirectConsumerCloser(consumer)
 
 	partitions, err := input.subscribeDirect(ctx, deadline, consumer)
 	if err != nil {
 		if isDirectAbort(err) {
-			// subscribeDirect already aborted the broker connections and closed
-			// every partition consumer and the client within its bounded budget.
+			// The subscription goroutine owns the late cleanup of the consumer
+			// and of every partition consumer it created. The caller returned
+			// as soon as the deadline or cancellation fired and must not close
+			// them here as well.
 			return err
 		}
 		input.closeDirectPartitions(partitions)
 		_ = closeDirectConsumer(consumer)
 		return err
-	}
-	// A deadline or cancellation that fired before the subscription was fully
-	// established is a failure, even if the last ConsumePartition call happened
-	// to return successfully.
-	if err := ctx.Err(); err != nil {
-		input.closeDirectPartitions(partitions)
-		_ = closeDirectConsumer(consumer)
-		return directAbortError(ctx, deadline, "before subscribing to kafka partitions")
 	}
 
 	return input.runDirectLoop(ctx, consumer, partitions)
@@ -221,22 +189,18 @@ func (input *kafkaInput) consumeDirect() error {
 // bounded-read limits are changed; TLS, SASL, version and consumer parameters
 // shared with the consumer-group path are left untouched.
 func applyDirectLimits(cfg *sarama.Config, timeout time.Duration) error {
-	// A preview of a misspelled or deleted topic must stay read-only. Sarama
-	// refreshes the metadata of a topic that is missing from its cache, and
-	// only MetadataRequest v4 or newer can carry the "do not auto-create"
-	// flag. Kafka 0.11 supports v4 and the vendored Sarama selects it for 0.11
-	// when this flag is disabled (v5 is only used for 1.0 and newer), so 0.11
-	// is safe here. Older brokers would fall back to v1, where the flag is not
-	// encoded at all; refuse the preview instead of risking a topic being
-	// created by a read-only request.
-	if !cfg.Version.IsAtLeast(sarama.V0_11_0_0) {
-		return fmt.Errorf(
-			"direct read requires kafka version 0.11.0 or newer, got %s: "+
-				"metadata requests before v4 cannot disable automatic topic creation",
-			cfg.Version)
-	}
-	cfg.Metadata.AllowAutoTopicCreation = false
-
+	// A preview of a misspelled or deleted topic must stay read-only, but
+	// stock Sarama has no config switch for it: on Kafka 1.0+ every
+	// topic-scoped metadata request allows the broker to auto-create the
+	// topic. The direct branch therefore validates the configured topics with
+	// a full, topic-less metadata refresh before resolving partitions; full
+	// refreshes never allow auto-creation (see preflightDirectTopics).
+	//
+	// Accepted residual (reviewer P2): if a topic is deleted between that
+	// preflight and the subscription, stock Sarama's internal dispatch can
+	// still send a topic-scoped refresh for it, which may auto-create the
+	// topic. The window is small and cannot be closed without the withdrawn
+	// vendor patch.
 	cfg.ChannelBufferSize = directChannelBufferSize
 	cfg.Consumer.Fetch.Max = directFetchMaxBytes
 
@@ -327,12 +291,53 @@ func (input *kafkaInput) connectDirect(
 	return nil, fmt.Errorf("direct read: connecting to kafka: %w", lastErr)
 }
 
-// directSubscription is the result of the resolve+subscribe phase. The result
-// channel is buffered so the subscription goroutine can always deliver its
-// result, even when the deadline path has already stopped waiting for it.
-type directSubscription struct {
+// directSubscribeHandoff coordinates ownership of the subscription result
+// between the caller and the subscription goroutine. Exactly one side closes
+// the client and the partition consumers: the caller when it receives the
+// result before the deadline, the goroutine when the caller abandoned the
+// subscription because the deadline or cancellation fired. The goroutine can
+// be stuck in a synchronous Sarama call until a slow broker answers, so the
+// cleanup is handed off instead of being shared or awaited.
+type directSubscribeHandoff struct {
 	partitions []*directPartition
 	err        error
+	ready      chan struct{}
+	decision   chan bool
+}
+
+func newDirectSubscribeHandoff() *directSubscribeHandoff {
+	return &directSubscribeHandoff{
+		ready:    make(chan struct{}),
+		decision: make(chan bool, 1),
+	}
+}
+
+// preflightDirectTopics verifies that every configured topic exists before the
+// preview resolves partitions or subscribes. Sarama sends a topic-scoped
+// MetadataRequest with allow_auto_topic_creation=true (Kafka 1.0+) as soon as
+// a named topic is missing from its cache, so a read-only preview of a typo or
+// a deleted topic must fail here, before any named request. RefreshMetadata
+// without topics is a full refresh, which stock Sarama always encodes with
+// auto-creation disabled; Topics then reads the refreshed cache and does not
+// send a request of its own.
+func (input *kafkaInput) preflightDirectTopics(consumer directConsumer) error {
+	if err := consumer.RefreshMetadata(); err != nil {
+		return fmt.Errorf("direct read: refreshing kafka metadata: %w", err)
+	}
+	topics, err := consumer.Topics()
+	if err != nil {
+		return fmt.Errorf("direct read: listing kafka topics: %w", err)
+	}
+	known := make(map[string]struct{}, len(topics))
+	for _, topic := range topics {
+		known[topic] = struct{}{}
+	}
+	for _, topic := range input.config.Topics {
+		if _, ok := known[topic]; !ok {
+			return fmt.Errorf("direct read: topic %q does not exist", topic)
+		}
+	}
+	return nil
 }
 
 // subscribeDirect resolves partitions and creates one partition consumer per
@@ -340,78 +345,57 @@ type directSubscription struct {
 // phase is a failure: a preview that never established a healthy subscription
 // must not look like an empty topic.
 //
-// consumer.Partitions and consumer.ConsumePartition are synchronous Sarama
-// calls without a context, so a worker only notices the deadline before it
-// starts a call. A per-request socket timeout cannot bound the phase either:
-// requests for many partitions queue on the same broker connection. The whole
-// phase therefore runs in a goroutine; on deadline or cancellation the broker
-// sockets are aborted, which makes every in-flight metadata or offset request
-// return at once and rejects any recovery request. The subscription goroutine
-// and the client close are awaited under one bounded budget.
+// consumer.RefreshMetadata, consumer.Partitions and consumer.ConsumePartition
+// are synchronous Sarama calls without a context, so the whole phase runs in a
+// goroutine. On deadline or cancellation the caller returns immediately and
+// hands the late cleanup to that goroutine: requests already queued on a slow
+// broker can take as long as the broker needs to answer and must not hold
+// Completion() open. The caller never closes the consumer or the partition
+// consumers on this abort path, and the goroutine closes exactly once.
 func (input *kafkaInput) subscribeDirect(
 	ctx context.Context,
 	deadline time.Time,
 	consumer directConsumer,
 ) ([]*directPartition, error) {
-	done := make(chan directSubscription, 1)
+	handoff := newDirectSubscribeHandoff()
 	go func() {
 		partitions, err := input.subscribeDirectBlocking(ctx, deadline, consumer)
-		if ctx.Err() == nil {
-			done <- directSubscription{partitions: partitions, err: err}
+		if ctx.Err() != nil || isDirectAbort(err) {
+			// The deadline or cancellation raced the last synchronous call.
+			// The caller cannot receive these partition consumers anymore (and
+			// must not close them), so this goroutine owns their cleanup and
+			// the final consumer close. The caller already returned and does
+			// not wait for this.
+			handoff.err = directAbortError(ctx, deadline, "while subscribing to kafka partitions")
+			close(handoff.ready)
+			input.closeDirectPartitions(partitions)
+			_ = closeDirectConsumer(consumer)
 			return
 		}
-		// The deadline or cancellation raced the last synchronous call. The
-		// caller cannot receive these partition consumers anymore, so this
-		// goroutine owns their cleanup.
-		input.closeDirectPartitions(partitions)
-		done <- directSubscription{
-			err: directAbortError(ctx, deadline, "while subscribing to kafka partitions"),
+		handoff.partitions = partitions
+		handoff.err = err
+		close(handoff.ready)
+		// The caller either takes ownership of the result or abandons it
+		// because its deadline fired concurrently. Only then does this
+		// goroutine know whether it must clean up.
+		if !<-handoff.decision {
+			input.closeDirectPartitions(partitions)
+			_ = closeDirectConsumer(consumer)
 		}
-		// The caller may have stopped waiting when the cleanup budget expired;
-		// make sure the client is still released in that case. Close is
-		// idempotent through directConsumerCloser.
-		_ = closeDirectConsumer(consumer)
 	}()
 
 	select {
-	case result := <-done:
-		if !isDirectAbort(result.err) {
-			return result.partitions, result.err
-		}
-		// The subscription already observed the abort. It only cleans up after
-		// itself when it sees ctx itself, so close anything it returned here.
-		input.closeDirectPartitions(result.partitions)
-		done = nil
-	case <-ctx.Done():
-	}
-
-	// Consumer.Close is graceful: it drains queued responses and can therefore
-	// sit behind a slow broker's whole request backlog. Abort the broker
-	// sockets first so the blocked requests fail immediately; Close then marks
-	// the client closed, which makes every subsequent Sarama call fail fast
-	// instead of trying to recover over new connections.
-	if aborter, ok := consumer.(directConsumerAborter); ok {
-		aborter.Abort()
-	}
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- consumer.Close() }()
-
-	timer := time.NewTimer(directReaderShutdownBudget)
-	defer timer.Stop()
-	for done != nil || closeDone != nil {
-		select {
-		case result := <-done:
-			// A successful result can race the cancellation. Abort semantics
-			// win, so its partition consumers are closed here.
-			input.closeDirectPartitions(result.partitions)
-			done = nil
-		case <-closeDone:
-			closeDone = nil
-		case <-timer.C:
+	case <-handoff.ready:
+		if ctx.Err() != nil {
+			handoff.decision <- false
 			return nil, directAbortError(ctx, deadline, "while subscribing to kafka partitions")
 		}
+		handoff.decision <- true
+		return handoff.partitions, handoff.err
+	case <-ctx.Done():
+		handoff.decision <- false
+		return nil, directAbortError(ctx, deadline, "while subscribing to kafka partitions")
 	}
-	return nil, directAbortError(ctx, deadline, "while subscribing to kafka partitions")
 }
 
 // subscribeDirectBlocking is the synchronous resolve+subscribe phase run by
@@ -423,6 +407,15 @@ func (input *kafkaInput) subscribeDirectBlocking(
 	consumer directConsumer,
 ) ([]*directPartition, error) {
 	partitions := make(map[string][]int32, len(input.config.Topics))
+	if err := ctx.Err(); err != nil {
+		return nil, directAbortError(ctx, deadline, "before subscribing to kafka partitions")
+	}
+	// The read-only topic check must happen before any partition or
+	// subscription call: those can trigger a named metadata refresh that stock
+	// Sarama does not guard against auto topic creation.
+	if err := input.preflightDirectTopics(consumer); err != nil {
+		return nil, err
+	}
 	total := 0
 	for _, topic := range input.config.Topics {
 		if err := ctx.Err(); err != nil {

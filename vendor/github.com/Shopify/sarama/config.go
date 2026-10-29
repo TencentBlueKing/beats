@@ -121,13 +121,6 @@ type Config struct {
 		// and usually more convenient, but can take up a substantial amount of
 		// memory if you have many topics and partitions. Defaults to true.
 		Full bool
-
-		// Whether to allow the broker to auto-create a topic when a metadata
-		// request is sent for a topic that does not exist. Defaults to true.
-		// Metadata requests for all topics always disable auto-creation.
-		// The flag can only be encoded by MetadataRequest v4 and later, so it
-		// has no effect when Version is older than V0_11_0_0.
-		AllowAutoTopicCreation bool
 	}
 
 	// Producer is the namespace for configuration related to producing messages,
@@ -401,7 +394,6 @@ func NewConfig() *Config {
 	c.Metadata.Retry.Backoff = 250 * time.Millisecond
 	c.Metadata.RefreshFrequency = 10 * time.Minute
 	c.Metadata.Full = true
-	c.Metadata.AllowAutoTopicCreation = true
 
 	c.Producer.MaxMessageBytes = 1000000
 	c.Producer.RequiredAcks = WaitForLocal

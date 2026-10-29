@@ -4,7 +4,6 @@ import (
 	"math/rand"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -118,10 +117,6 @@ type client struct {
 	// so the result is cached.  It is important to update this value whenever metadata is changed
 	cachedPartitionsResults map[string][maxPartitionIndex][]int32
 
-	// aborted is set by Abort. A client that is being aborted must make every
-	// request fail fast, but Close still has to tear the maps down afterwards.
-	aborted int32
-
 	lock sync.RWMutex // protects access to the maps that hold cluster state.
 }
 
@@ -195,27 +190,6 @@ func (client *client) Brokers() []*Broker {
 	return brokers
 }
 
-// Abort closes every broker and seed-broker connection immediately, without
-// the graceful response drain performed by Close. It is used to interrupt
-// in-flight requests when a caller-side deadline expires. After Abort every
-// request fails with ErrClosedClient, so in-flight error handling cannot start
-// a recovery request over a new connection.
-func (client *client) Abort() {
-	atomic.StoreInt32(&client.aborted, 1)
-
-	client.lock.RLock()
-	brokers := make([]*Broker, 0, len(client.brokers)+len(client.seedBrokers))
-	for _, broker := range client.brokers {
-		brokers = append(brokers, broker)
-	}
-	brokers = append(brokers, client.seedBrokers...)
-	client.lock.RUnlock()
-
-	for _, broker := range brokers {
-		broker.Abort()
-	}
-}
-
 func (client *client) InitProducerID() (*InitProducerIDResponse, error) {
 	var err error
 	for broker := client.any(); broker != nil; broker = client.any() {
@@ -237,7 +211,7 @@ func (client *client) InitProducerID() (*InitProducerIDResponse, error) {
 }
 
 func (client *client) Close() error {
-	if client.brokers == nil {
+	if client.Closed() {
 		// Chances are this is being called from a defer() and the error will go unobserved
 		// so we go ahead and log the event in this case.
 		Logger.Printf("Close() called on already closed client")
@@ -268,12 +242,6 @@ func (client *client) Close() error {
 }
 
 func (client *client) Closed() bool {
-	// The aborted check comes first: Abort makes the client behave as closed
-	// and the broker map may be read only after the request has not been
-	// rejected by the flag.
-	if atomic.LoadInt32(&client.aborted) == 1 {
-		return true
-	}
 	return client.brokers == nil
 }
 
@@ -783,11 +751,10 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int)
 	}
 
 	for broker := client.any(); broker != nil; broker = client.any() {
-		allowAutoTopicCreation := client.conf.Metadata.AllowAutoTopicCreation
+		allowAutoTopicCreation := true
 		if len(topics) > 0 {
 			Logger.Printf("client/metadata fetching metadata for %v from broker %s\n", topics, broker.addr)
 		} else {
-			// A full metadata request must never auto-create topics.
 			allowAutoTopicCreation = false
 			Logger.Printf("client/metadata fetching metadata for all topics from broker %s\n", broker.addr)
 		}
@@ -795,14 +762,6 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int)
 		req := &MetadataRequest{Topics: topics, AllowAutoTopicCreation: allowAutoTopicCreation}
 		if client.conf.Version.IsAtLeast(V1_0_0_0) {
 			req.Version = 5
-		} else if client.conf.Version.IsAtLeast(V0_11_0_0) && !client.conf.Metadata.AllowAutoTopicCreation {
-			// Kafka 0.11 supports MetadataRequest v4, the first version that
-			// encodes allow_auto_topic_creation. Without this branch Sarama
-			// would send v1 for 0.11 and silently drop the disabled flag.
-			// Only opt in when auto-creation is explicitly disabled so the
-			// default 0.11 metadata traffic (including full refreshes) keeps
-			// using v1.
-			req.Version = 4
 		} else if client.conf.Version.IsAtLeast(V0_10_0_0) {
 			req.Version = 1
 		}
@@ -850,13 +809,6 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int)
 func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bool) (retry bool, err error) {
 	client.lock.Lock()
 	defer client.lock.Unlock()
-
-	// A metadata refresh can still complete after Close has nilled the client
-	// maps (for example when a caller aborts in-flight requests). Drop the
-	// response instead of writing into the closed client.
-	if client.brokers == nil {
-		return false, ErrClosedClient
-	}
 
 	// For all the brokers we received:
 	// - if it is a new ID, save it

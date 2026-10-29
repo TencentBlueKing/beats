@@ -30,9 +30,6 @@ type Broker struct {
 	opened        int32
 	responses     chan responsePromise
 	done          chan bool
-	// abortConn mirrors conn for Abort, which must be able to close the socket
-	// without taking the broker lock while requests are queued behind it.
-	abortConn atomic.Value
 
 	registeredMetrics []string
 
@@ -171,7 +168,6 @@ func (b *Broker) Open(conf *Config) error {
 			return
 		}
 		b.conn = newBufConn(b.conn)
-		b.abortConn.Store(b.conn)
 
 		b.conf = conf
 
@@ -259,16 +255,6 @@ func (b *Broker) Close() error {
 	atomic.StoreInt32(&b.opened, 0)
 
 	return err
-}
-
-// Abort closes the broker connection immediately without taking the broker
-// lock or draining queued responses. Close is graceful and can be delayed
-// behind a slow broker; Abort is meant to interrupt requests blocked by a
-// caller-side deadline.
-func (b *Broker) Abort() {
-	if conn, ok := b.abortConn.Load().(net.Conn); ok && conn != nil {
-		_ = conn.Close()
-	}
 }
 
 // ID returns the broker ID retrieved from Kafka's metadata, or -1 if that is not known.
