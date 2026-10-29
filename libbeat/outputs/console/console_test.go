@@ -15,17 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//go:build !integration
 // +build !integration
 
 package console
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/elastic/beats/libbeat/beat"
 	"github.com/elastic/beats/libbeat/common"
@@ -137,4 +141,197 @@ func run(codec codec.Codec, batches ...publisher.Batch) (string, error) {
 
 func event(k, v string) common.MapStr {
 	return common.MapStr{k: v}
+}
+
+type failingCodec struct {
+	err error
+}
+
+func (c failingCodec) Encode(string, *beat.Event) ([]byte, error) {
+	return nil, c.err
+}
+
+func collectConsoleError(t *testing.T) <-chan error {
+	t.Helper()
+	errCh := make(chan error, 4)
+	SetErrorHandler(func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	})
+	t.Cleanup(func() { SetErrorHandler(nil) })
+	return errCh
+}
+
+func TestConsoleNotifiesEncodeFailure(t *testing.T) {
+	errCh := collectConsoleError(t)
+	batch := outest.NewBatch(beat.Event{Fields: event("field", "value")})
+	c := &console{
+		codec:    failingCodec{errors.New("encode failed")},
+		observer: outputs.NewNilObserver(),
+		writer:   bufio.NewWriterSize(io.Discard, 8*1024),
+		index:    "test",
+	}
+
+	require.NoError(t, c.Publish(batch))
+	if !assert.Len(t, batch.Signals, 1) {
+		return
+	}
+	assert.Equal(t, outest.BatchACK, batch.Signals[0].Tag)
+
+	select {
+	case err := <-errCh:
+		assert.Contains(t, err.Error(), "encoding failed")
+		assert.Contains(t, err.Error(), "encode failed")
+	default:
+		t.Fatal("console encode failure was not reported")
+	}
+}
+
+func TestConsoleNotifiesFlushFailure(t *testing.T) {
+	errCh := collectConsoleError(t)
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+
+	batch := outest.NewBatch(beat.Event{Fields: event("field", "value")})
+	c := &console{
+		out:      w,
+		codec:    json.New("1.2.3", json.Config{}),
+		observer: outputs.NewNilObserver(),
+		writer:   bufio.NewWriterSize(w, 8*1024),
+		index:    "test",
+	}
+	t.Cleanup(func() { w.Close() })
+
+	require.NoError(t, c.Publish(batch))
+	if !assert.Len(t, batch.Signals, 1) {
+		return
+	}
+	assert.Equal(t, outest.BatchACK, batch.Signals[0].Tag)
+
+	select {
+	case err := <-errCh:
+		assert.Contains(t, err.Error(), "flush failed")
+	default:
+		t.Fatal("console flush failure was not reported")
+	}
+}
+
+func TestConsoleWithoutErrorHandlerKeepsOriginalBehavior(t *testing.T) {
+	SetErrorHandler(nil)
+
+	batch := outest.NewBatch(beat.Event{Fields: event("field", "value")})
+	c := &console{
+		codec:    failingCodec{errors.New("encode failed")},
+		observer: outputs.NewNilObserver(),
+		writer:   bufio.NewWriterSize(io.Discard, 8*1024),
+		index:    "test",
+	}
+
+	assert.NotPanics(t, func() {
+		assert.NoError(t, c.Publish(batch))
+	})
+	if assert.Len(t, batch.Signals, 1) {
+		assert.Equal(t, outest.BatchACK, batch.Signals[0].Tag)
+	}
+}
+
+type recordingObserver struct {
+	writeErrors int
+}
+
+func (o *recordingObserver) NewBatch(int)     {}
+func (o *recordingObserver) Acked(int)        {}
+func (o *recordingObserver) Failed(int)       {}
+func (o *recordingObserver) Dropped(int)      {}
+func (o *recordingObserver) Duplicate(int)    {}
+func (o *recordingObserver) Cancelled(int)    {}
+func (o *recordingObserver) WriteError(error) { o.writeErrors++ }
+func (o *recordingObserver) WriteBytes(int)   {}
+func (o *recordingObserver) ReadError(error)  {}
+func (o *recordingObserver) ReadBytes(int)    {}
+func (o *recordingObserver) ErrTooMany(int)   {}
+
+type failWriter struct{ err error }
+
+func (w failWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestConsoleFlushWithoutHandlerKeepsOriginalBehavior(t *testing.T) {
+	SetErrorHandler(nil)
+	observer := &recordingObserver{}
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	t.Cleanup(func() { w.Close() })
+
+	batch := outest.NewBatch(beat.Event{Fields: event("field", "value")})
+	c := &console{
+		out:      w,
+		codec:    json.New("1.2.3", json.Config{}),
+		observer: observer,
+		writer:   bufio.NewWriterSize(w, 8*1024),
+		index:    "test",
+	}
+
+	require.NoError(t, c.Publish(batch))
+	assert.Equal(t, 0, observer.writeErrors)
+	if assert.Len(t, batch.Signals, 1) {
+		assert.Equal(t, outest.BatchACK, batch.Signals[0].Tag)
+	}
+}
+
+func TestConsoleNotifiesWriteFailure(t *testing.T) {
+	errCh := collectConsoleError(t)
+	batch := outest.NewBatch(beat.Event{Fields: event("field", "value")})
+	c := &console{
+		codec:    json.New("1.2.3", json.Config{}),
+		observer: outputs.NewNilObserver(),
+		writer:   bufio.NewWriterSize(failWriter{errors.New("write failed")}, 8),
+		index:    "test",
+	}
+
+	require.NoError(t, c.Publish(batch))
+	if assert.Len(t, batch.Signals, 1) {
+		assert.Equal(t, outest.BatchACK, batch.Signals[0].Tag)
+	}
+	select {
+	case err := <-errCh:
+		assert.Contains(t, err.Error(), "write failed")
+	default:
+		t.Fatal("console write failure was not reported")
+	}
+}
+
+func TestConsoleErrorHandlerReportsOnlyTheFirstError(t *testing.T) {
+	var calls int
+	SetErrorHandler(func(error) { calls++ })
+	t.Cleanup(func() { SetErrorHandler(nil) })
+
+	batch := outest.NewBatch(
+		beat.Event{Fields: event("field", "one")},
+		beat.Event{Fields: event("field", "two")},
+	)
+	c := &console{
+		codec:    failingCodec{errors.New("encode failed")},
+		observer: outputs.NewNilObserver(),
+		writer:   bufio.NewWriterSize(io.Discard, 8*1024),
+		index:    "test",
+	}
+	require.NoError(t, c.Publish(batch))
+	assert.Equal(t, 1, calls)
+}
+
+func TestSetErrorHandlerRestoreClearsObserver(t *testing.T) {
+	var calls int
+	restore := SetErrorHandler(func(error) { calls++ })
+	notifyError(errors.New("one"))
+	notifyError(errors.New("two"))
+	assert.Equal(t, 1, calls)
+
+	restore()
+	notifyError(errors.New("three"))
+	assert.Equal(t, 1, calls)
 }

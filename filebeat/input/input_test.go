@@ -21,12 +21,14 @@
 package input
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNextScanIntervalDefaultsToBase(t *testing.T) {
@@ -125,6 +127,122 @@ func (i *controlledInput) Run() {
 }
 func (i *controlledInput) Stop() {}
 func (i *controlledInput) Wait() {}
+
+type finiteInput struct {
+	completion chan struct{}
+	err        error
+}
+
+func (*finiteInput) Reload() {}
+func (*finiteInput) Run()    {}
+func (*finiteInput) Stop()   {}
+func (*finiteInput) Wait()   {}
+func (i *finiteInput) Completion() (<-chan struct{}, bool) {
+	return i.completion, true
+}
+func (i *finiteInput) CompletionErr() error { return i.err }
+
+type legacyInput struct{}
+
+func (*legacyInput) Reload() {}
+func (*legacyInput) Run()    {}
+func (*legacyInput) Stop()   {}
+func (*legacyInput) Wait()   {}
+
+func TestRunnerForwardsOptionalCompletion(t *testing.T) {
+	completion := make(chan struct{})
+	expected := errors.New("terminal preview error")
+	runner := &Runner{input: &finiteInput{completion: completion, err: expected}}
+
+	got, ok := runner.Completion()
+	require.True(t, ok)
+	assert.Equal(t, (<-chan struct{})(completion), got)
+	assert.Equal(t, expected, runner.CompletionErr())
+
+	// A legacy input keeps the original lifecycle and reports no completion.
+	legacy := &Runner{input: &legacyInput{}}
+	got, ok = legacy.Completion()
+	assert.False(t, ok)
+	assert.Nil(t, got)
+	assert.NoError(t, legacy.CompletionErr())
+
+	// A Runner that failed before constructing its input must not panic.
+	empty := &Runner{}
+	got, ok = empty.Completion()
+	assert.False(t, ok)
+	assert.Nil(t, got)
+	assert.NoError(t, empty.CompletionErr())
+}
+
+func TestRunnerStopIsIdempotent(t *testing.T) {
+	const inputType = "idempotent-test-input"
+	inputList.Add(inputType)
+	runner := &Runner{
+		config: inputConfig{Type: inputType},
+		done:   make(chan struct{}),
+		wg:     &sync.WaitGroup{},
+	}
+
+	assert.NotPanics(t, func() {
+		runner.Stop()
+		runner.Stop()
+	})
+}
+
+type stopGateInput struct {
+	started chan struct{}
+	release chan struct{}
+	stops   int32
+	once    sync.Once
+}
+
+func (i *stopGateInput) Reload() {}
+func (i *stopGateInput) Run() {
+	i.once.Do(func() { close(i.started) })
+}
+func (i *stopGateInput) Stop() {
+	atomic.AddInt32(&i.stops, 1)
+	<-i.release
+}
+func (i *stopGateInput) Wait() {}
+
+func TestRunnerConcurrentStopCallsInputStopOnce(t *testing.T) {
+	const inputType = "concurrent-stop-input"
+	release := make(chan struct{})
+	inp := &stopGateInput{started: make(chan struct{}), release: release}
+	runner := &Runner{
+		config: inputConfig{Type: inputType, ScanFrequency: time.Hour},
+		input:  inp,
+		done:   make(chan struct{}),
+		wg:     &sync.WaitGroup{},
+	}
+	runner.Start()
+	select {
+	case <-inp.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not start")
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		runner.Stop()
+		close(returned)
+	}()
+	go runner.Stop()
+
+	select {
+	case <-returned:
+		t.Fatal("Stop returned before input.Stop was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return after input.Stop was released")
+	}
+	assert.Equal(t, int32(1), atomic.LoadInt32(&inp.stops))
+}
 
 func TestRunnerUsesMeasuredScanDurationForNextInterval(t *testing.T) {
 	defer SetAdaptiveScanIntervalFunc(nil)

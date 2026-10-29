@@ -34,9 +34,14 @@ import (
 
 type kafkaInputConfig struct {
 	// Kafka hosts with port, e.g. "localhost:9092"
-	Hosts                    []string          `config:"hosts" validate:"required"`
-	Topics                   []string          `config:"topics" validate:"required"`
-	GroupID                  string            `config:"group_id" validate:"required"`
+	Hosts []string `config:"hosts" validate:"required"`
+	// Topics is required for both the consumer-group and direct-read modes.
+	Topics []string `config:"topics" validate:"required"`
+	// GroupID is optional at unpack time so direct_read can omit it. Validate
+	// requires it for the consumer-group mode and rejects it for direct_read.
+	// A pointer keeps "not configured" distinguishable from an explicit empty
+	// string, which must also be rejected in direct_read mode.
+	GroupID                  *string           `config:"group_id"`
 	ClientID                 string            `config:"client_id"`
 	Version                  kafka.Version     `config:"version"`
 	InitialOffset            initialOffset     `config:"initial_offset"`
@@ -52,6 +57,48 @@ type kafkaInputConfig struct {
 	Password                 string            `config:"password"`
 	Mechanism                string            `config:"sasl_mechanism"`
 	ExpandEventListFromField string            `config:"expand_event_list_from_field"`
+	DirectRead               *directReadConfig `config:"direct_read"`
+}
+
+// directReadConfig selects the finite, consumer-group-less preview read mode.
+// max_events and timeout use pointers so "the field was provided" can be
+// distinguished from the zero value while still rejecting zero explicitly.
+type directReadConfig struct {
+	Enabled   bool           `config:"enabled"`
+	MaxEvents *int           `config:"max_events"`
+	Timeout   *time.Duration `config:"timeout"`
+}
+
+const (
+	directReadMinEvents  = 1
+	directReadMaxEvents  = 1000
+	directReadMinTimeout = time.Second
+	directReadMaxTimeout = 60 * time.Second
+)
+
+func (d *directReadConfig) validate() error {
+	if d == nil {
+		return nil
+	}
+	if !d.Enabled {
+		if d.MaxEvents != nil || d.Timeout != nil {
+			return errors.New("direct_read.max_events and direct_read.timeout require direct_read.enabled: true")
+		}
+		return nil
+	}
+	if d.MaxEvents == nil {
+		return errors.New("direct_read.max_events is required when direct_read.enabled is true")
+	}
+	if d.Timeout == nil {
+		return errors.New("direct_read.timeout is required when direct_read.enabled is true")
+	}
+	if *d.MaxEvents < directReadMinEvents || *d.MaxEvents > directReadMaxEvents {
+		return fmt.Errorf("direct_read.max_events must be between %d and %d", directReadMinEvents, directReadMaxEvents)
+	}
+	if *d.Timeout < directReadMinTimeout || *d.Timeout > directReadMaxTimeout {
+		return fmt.Errorf("direct_read.timeout must be between %s and %s", directReadMinTimeout, directReadMaxTimeout)
+	}
+	return nil
 }
 
 type kafkaFetch struct {
@@ -134,6 +181,9 @@ func (c *kafkaInputConfig) Validate() error {
 	if len(c.Hosts) == 0 {
 		return errors.New("no hosts configured")
 	}
+	if len(c.Topics) == 0 {
+		return errors.New("no topics configured")
+	}
 
 	if err := c.Version.Validate(); err != nil {
 		return err
@@ -146,6 +196,24 @@ func (c *kafkaInputConfig) Validate() error {
 	if _, err := kafka.NormalizeSASLMechanism(c.Mechanism); err != nil {
 		return err
 	}
+
+	// Validate the direct-read block before group_id. A disabled block that
+	// still carries limits is a config error even when group_id is also missing.
+	if err := c.DirectRead.validate(); err != nil {
+		return err
+	}
+
+	direct := c.DirectRead != nil && c.DirectRead.Enabled
+	if direct {
+		// A direct preview must never join or create a consumer group. An
+		// explicit empty group_id is still "configured" and is rejected too.
+		if c.GroupID != nil {
+			return errors.New("group_id must not be set when direct_read.enabled is true")
+		}
+	} else if c.GroupID == nil || *c.GroupID == "" {
+		return errors.New("group_id is required when direct_read is disabled")
+	}
+
 	return nil
 }
 

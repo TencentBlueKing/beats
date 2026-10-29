@@ -120,6 +120,14 @@ type Input interface {
 	Wait()
 }
 
+// completionProvider is optionally implemented by finite inputs (currently the
+// Kafka direct-read branch). The completion channel is closed exactly once
+// after the input has stopped producing events and finished its cleanup.
+type completionProvider interface {
+	Completion() (<-chan struct{}, bool)
+	CompletionErr() error
+}
+
 // Runner encapsulate the lifecycle of the input
 type Runner struct {
 	config   inputConfig
@@ -129,6 +137,10 @@ type Runner struct {
 	ID       uint64
 	Once     bool
 	beatDone chan struct{}
+
+	// stopOnce makes Stop safe when both the normal teardown path and an
+	// externally requested graceful stop race with each other.
+	stopOnce sync.Once
 
 	// 仅用于关联进程内本次 Runner 生命周期对应的自适应状态。
 	adaptiveScanID uint64
@@ -263,12 +275,42 @@ func (p *Runner) Reload() {
 	p.input.Reload()
 }
 
-// Stop stops the input and with it all harvesters
+// Completion forwards an optional finite-input completion signal. Inputs that
+// only support their original lifecycle (file, docker, syslog, ...) return
+// false and keep the existing behavior.
+func (p *Runner) Completion() (<-chan struct{}, bool) {
+	if p.input == nil {
+		return nil, false
+	}
+	provider, ok := p.input.(completionProvider)
+	if !ok {
+		return nil, false
+	}
+	return provider.Completion()
+}
+
+// CompletionErr forwards the terminal completion error. It must be read only
+// after Completion() has been closed.
+func (p *Runner) CompletionErr() error {
+	if p.input == nil {
+		return nil
+	}
+	provider, ok := p.input.(completionProvider)
+	if !ok {
+		return nil
+	}
+	return provider.CompletionErr()
+}
+
+// Stop stops the input and with it all harvesters. Repeated or concurrent
+// calls are safe: the scan loop is stopped and waited for exactly once.
 func (p *Runner) Stop() {
-	// Stop scanning and wait for completion
-	close(p.done)
-	p.wg.Wait()
-	inputList.Remove(p.config.Type)
+	p.stopOnce.Do(func() {
+		// Stop scanning and wait for completion
+		close(p.done)
+		p.wg.Wait()
+		inputList.Remove(p.config.Type)
+	})
 }
 
 func (p *Runner) stop() {

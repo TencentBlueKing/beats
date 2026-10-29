@@ -52,9 +52,19 @@ type kafkaInput struct {
 	saramaConfig    *sarama.Config
 	context         input.Context
 	outlet          channel.Outleter
-	saramaWaitGroup sync.WaitGroup // indicates a sarama consumer group is active
+	saramaWaitGroup sync.WaitGroup // indicates a sarama consumer group or direct read is active
 	log             *logp.Logger
 	runOnce         sync.Once
+
+	// Direct-read completion state. completion is closed exactly once after all
+	// partition readers and the consumer have been cleaned up; completionErr is
+	// written before the close and is safe to read after receiving from it.
+	completion     chan struct{}
+	completionOnce sync.Once
+	completionErr  error
+
+	// directConsumerFactory is a test seam. Production uses sarama.NewConsumer.
+	directConsumerFactory directConsumerFactory
 }
 
 // NewInput creates a new kafka input
@@ -85,6 +95,7 @@ func NewInput(
 		context:      context,
 		outlet:       out,
 		log:          logp.NewLogger("kafka input").With("hosts", config.Hosts),
+		completion:   make(chan struct{}),
 	}
 
 	return input, nil
@@ -123,6 +134,26 @@ func (input *kafkaInput) runConsumerGroup(
 // Run starts the input by scanning for incoming messages and errors.
 func (input *kafkaInput) Run() {
 	input.runOnce.Do(func() {
+		if input.isDirectRead() {
+			// The direct read owns its lifecycle and finishes by itself. Register
+			// the wait group before starting the goroutine so Wait() can never
+			// return while the connection phase is still in progress.
+			input.saramaWaitGroup.Add(1)
+			go func() {
+				defer input.saramaWaitGroup.Done()
+				err := func() (err error) {
+					defer func() {
+						if recovered := recover(); recovered != nil {
+							err = fmt.Errorf("direct read: panic: %v", recovered)
+						}
+					}()
+					return input.consumeDirect()
+				}()
+				input.complete(err)
+			}()
+			return
+		}
+
 		go func() {
 			// Sarama uses standard go contexts to control cancellation, so we need
 			// to wrap our input context channel in that interface.
@@ -138,7 +169,7 @@ func (input *kafkaInput) Run() {
 			for context.Err() == nil {
 				// Connect to Kafka with a new consumer group.
 				consumerGroup, err := sarama.NewConsumerGroup(
-					input.config.Hosts, input.config.GroupID, input.saramaConfig)
+					input.config.Hosts, *input.config.GroupID, input.saramaConfig)
 				if err != nil {
 					input.log.Errorw(
 						"Error initializing kafka consumer group", "error", err)
@@ -159,16 +190,51 @@ func (input *kafkaInput) Run() {
 	})
 }
 
+func (input *kafkaInput) isDirectRead() bool {
+	return input.config.DirectRead != nil && input.config.DirectRead.Enabled
+}
+
+// complete closes the completion channel exactly once. The error is stored
+// before the close; callers must receive from Completion() before reading
+// CompletionErr().
+func (input *kafkaInput) complete(err error) {
+	input.completionOnce.Do(func() {
+		input.completionErr = err
+		close(input.completion)
+	})
+}
+
+// Completion reports the direct-read completion signal. Consumer-group mode
+// does not support finite completion and returns false.
+func (input *kafkaInput) Completion() (<-chan struct{}, bool) {
+	if !input.isDirectRead() {
+		return nil, false
+	}
+	return input.completion, true
+}
+
+// CompletionErr returns the terminal direct-read error, or nil on success. It
+// must only be read after Completion() has been closed.
+func (input *kafkaInput) CompletionErr() error {
+	return input.completionErr
+}
+
 // Reload runs the input
 func (p *kafkaInput) Reload() {
 	return
 }
 
-// Stop doesn't need to do anything because the kafka consumer group and the
-// input's outlet both have a context based on input.context.Done and will
-// shut themselves down, since the done channel is already closed as part of
-// the shutdown process in Runner.Stop().
+// Stop doesn't need to do anything for a consumer group because that path
+// and the input's outlet both watch input.context.Done, which Runner.Stop
+// closes. Direct read is different: completionErr is written by the goroutine
+// tracked on saramaWaitGroup, immediately before it exits. Waiting for that
+// group makes CompletionErr safe to read once Stop has returned. Callers that
+// only need the result can also block on Completion(); they must not read
+// CompletionErr before either of those happens.
 func (input *kafkaInput) Stop() {
+	if input.isDirectRead() {
+		input.saramaWaitGroup.Wait()
+	}
 }
 
 // Wait should shut down the input and wait for it to complete, however (see
@@ -244,51 +310,55 @@ type eventMeta struct {
 	message *sarama.ConsumerMessage
 }
 
-func (h *groupHandler) createEvents(
-	claim sarama.ConsumerGroupClaim,
+// createEvents converts a Kafka message into beat events. It is shared by the
+// consumer-group path and the direct-read path; group-specific ACK metadata is
+// attached by the consumer-group caller only. maxEvents bounds how many events
+// are expanded; 0 keeps the original unlimited consumer-group semantics and the
+// direct-read path passes its remaining event budget.
+func createEvents(
+	version kafka.Version,
+	expandEventListFromField string,
+	log *logp.Logger,
+	topic string,
+	partition int32,
 	message *sarama.ConsumerMessage,
+	maxEvents int,
 ) []beat.Event {
 	timestamp := time.Now()
 	kafkaFields := common.MapStr{
-		"topic":     claim.Topic(),
-		"partition": claim.Partition(),
+		"topic":     topic,
+		"partition": partition,
 		"offset":    message.Offset,
 		"key":       string(message.Key),
 	}
 
-	version, versionOk := h.version.Get()
-	if versionOk && version.IsAtLeast(sarama.V0_10_0_0) {
+	versionValue, versionOk := version.Get()
+	if versionOk && versionValue.IsAtLeast(sarama.V0_10_0_0) {
 		timestamp = message.Timestamp
 		if !message.BlockTimestamp.IsZero() {
 			kafkaFields["block_timestamp"] = message.BlockTimestamp
 		}
 	}
-	if versionOk && version.IsAtLeast(sarama.V0_11_0_0) {
+	if versionOk && versionValue.IsAtLeast(sarama.V0_11_0_0) {
 		kafkaFields["headers"] = arrayForKafkaHeaders(message.Headers)
 	}
 
 	// if expandEventListFromField has been set, then a check for the actual json object will be done and a return for multiple messages is executed
-	var events []beat.Event
 	var messages []string
-	if h.expandEventListFromField == "" {
+	if expandEventListFromField == "" {
 		messages = []string{string(message.Value)}
 	} else {
-		messages = h.parseMultipleMessages(message.Value)
+		messages = parseMultipleMessages(expandEventListFromField, log, message.Value, maxEvents)
 	}
+	events := make([]beat.Event, 0, len(messages))
 	for _, msg := range messages {
-		event := beat.Event{
+		events = append(events, beat.Event{
 			Timestamp: timestamp,
 			Fields: common.MapStr{
 				"data":  msg,
 				"kafka": kafkaFields,
 			},
-			Private: eventMeta{
-				handler: h,
-				message: message,
-			},
-		}
-		events = append(events, event)
-
+		})
 	}
 	return events
 }
@@ -320,32 +390,55 @@ func (h *groupHandler) ack(message *sarama.ConsumerMessage) {
 func (h *groupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	for msg := range claim.Messages() {
 		sess.MarkMessage(msg, "")
-		events := h.createEvents(claim, msg)
-		for _, event := range events {
-			var d = &util.Data{Event: event}
+		events := createEvents(
+			h.version,
+			h.expandEventListFromField,
+			h.log,
+			claim.Topic(),
+			claim.Partition(),
+			msg,
+			0, // the consumer-group path keeps expanding every element
+		)
+		for i := range events {
+			// The consumer-group branch keeps the original commit metadata; the
+			// direct branch must not attach any session/group metadata.
+			events[i].Private = eventMeta{handler: h, message: msg}
+			var d = &util.Data{Event: events[i]}
 			h.outlet.OnEvent(d)
 		}
 	}
 	return nil
 }
 
-// parseMultipleMessages will try to split the message into multiple ones based on the group field provided by the configuration
-func (h *groupHandler) parseMultipleMessages(bMessage []byte) []string {
+// parseMultipleMessages will try to split the message into multiple ones based on the group field provided by the configuration.
+// maxMessages bounds how many elements are serialized and returned; 0 means unlimited.
+func parseMultipleMessages(
+	expandEventListFromField string,
+	log *logp.Logger,
+	bMessage []byte,
+	maxMessages int,
+) []string {
 	var obj map[string][]interface{}
 	err := json.Unmarshal(bMessage, &obj)
 	if err != nil {
-		h.log.Errorw(fmt.Sprintf("Kafka desirializing multiple messages using the group object %s", h.expandEventListFromField), "error", err)
+		log.Errorw(fmt.Sprintf("Kafka desirializing multiple messages using the group object %s", expandEventListFromField), "error", err)
 		return []string{}
 	}
+	values := obj[expandEventListFromField]
+	// The direct-read preview passes its remaining max_events budget so a huge
+	// array is only serialized for the events that can still be delivered. The
+	// consumer-group path passes 0 and keeps the original expand-everything
+	// semantics.
+	if maxMessages > 0 && len(values) > maxMessages {
+		values = values[:maxMessages]
+	}
 	var messages []string
-	if len(obj[h.expandEventListFromField]) > 0 {
-		for _, ms := range obj[h.expandEventListFromField] {
-			js, err := json.Marshal(ms)
-			if err == nil {
-				messages = append(messages, string(js))
-			} else {
-				h.log.Errorw(fmt.Sprintf("Kafka serializing message %s", ms), "error", err)
-			}
+	for _, ms := range values {
+		js, err := json.Marshal(ms)
+		if err == nil {
+			messages = append(messages, string(js))
+		} else {
+			log.Errorw(fmt.Sprintf("Kafka serializing message %s", ms), "error", err)
 		}
 	}
 	return messages
