@@ -190,17 +190,20 @@ func (input *kafkaInput) consumeDirect() error {
 // shared with the consumer-group path are left untouched.
 func applyDirectLimits(cfg *sarama.Config, timeout time.Duration) error {
 	// A preview of a misspelled or deleted topic must stay read-only, but
-	// stock Sarama has no config switch for it: on Kafka 1.0+ every
-	// topic-scoped metadata request allows the broker to auto-create the
-	// topic. The direct branch therefore validates the configured topics with
-	// a full, topic-less metadata refresh before resolving partitions; full
-	// refreshes never allow auto-creation (see preflightDirectTopics).
+	// stock Sarama has no config switch for it: a topic-scoped metadata
+	// request can ask the broker to auto-create the topic (Kafka 1.0+ encodes
+	// allow_auto_topic_creation=true; older protocol versions cannot encode
+	// the flag at all). The direct branch therefore validates the configured
+	// topics with a full, topic-less metadata refresh before resolving
+	// partitions; full refreshes never allow auto-creation (see
+	// preflightDirectTopics).
 	//
-	// Accepted residual (reviewer P2): if a topic is deleted between that
-	// preflight and the subscription, stock Sarama's internal dispatch can
-	// still send a topic-scoped refresh for it, which may auto-create the
-	// topic. The window is small and cannot be closed without the withdrawn
-	// vendor patch.
+	// Accepted residual (reviewer P2, whole read lifetime): once the preflight
+	// passed, stock Sarama's internal dispatch/retry can still send a
+	// topic-scoped refresh for a topic that is deleted at any point while the
+	// preview is reading, and the broker may auto-create it. This cannot be
+	// closed without a vendor patch or a Sarama upgrade that carries the
+	// disable switch; the preview accepts it as a documented residual.
 	cfg.ChannelBufferSize = directChannelBufferSize
 	cfg.Consumer.Fetch.Max = directFetchMaxBytes
 

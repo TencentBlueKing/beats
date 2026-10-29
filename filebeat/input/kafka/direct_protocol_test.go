@@ -73,7 +73,11 @@ func TestDirectReadMissingTopicMetadataPreflight(t *testing.T) {
 		assert.Equal(t, 0, len(request.Topics),
 			"the read-only preview must only send full metadata requests, got %v", request.Topics)
 		// Full metadata requests always disable auto topic creation. For v4+
-		// the flag is on the wire; older versions simply cannot encode it.
+		// the flag is on the wire; older versions simply cannot encode it, so
+		// assert the version too instead of relying on a zero-value flag.
+		assert.True(t, int(request.Version) >= 4,
+			"full metadata request %d must use v4+ so the auto-create flag is on the wire, got v%d",
+			fullRequests, request.Version)
 		assert.False(t, request.AllowAutoTopicCreation,
 			"full metadata request %d must not allow auto topic creation", fullRequests)
 		fullRequests++
