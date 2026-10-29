@@ -712,39 +712,30 @@ func (input *kafkaInput) reportDirectReadErr(readErr chan<- error, err error) {
 	}
 }
 
-// publishDirectEvent delivers one event without letting a blocked outlet hold
-// the read loop past the preview deadline. The OnEvent call itself may still
-// be running after this returns; closing the outlet or exiting the process
-// unblocks it.
-func (input *kafkaInput) publishDirectEvent(ctx context.Context, event beat.Event) error {
+// publishDirectEvent delivers one event synchronously. A per-event goroutine
+// used to let the read loop return before the outlet finished, which could
+// deliver an event after Completion(); a synchronous call keeps every OnEvent
+// before the completion signal and guarantees that no OnEvent is still
+// running when consumeDirect returns. A blocked outlet is allowed to hold the
+// preview: bkunify's abort/StopPublish releases it. The deadline is still
+// checked before and after the call, so a deadline that fires while the outlet
+// blocks ends the preview without delivering another event.
+func (input *kafkaInput) publishDirectEvent(ctx context.Context, event beat.Event) (err error) {
 	if err := directDeliveryAbort(ctx.Err()); err != nil {
 		return err
 	}
-	type publishResult struct {
-		ok    bool
-		panic interface{}
-	}
-	done := make(chan publishResult, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				done <- publishResult{panic: r}
-			}
-		}()
-		done <- publishResult{ok: input.outlet.OnEvent(&util.Data{Event: event})}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("direct read: panic: %v", recovered)
+		}
 	}()
-	select {
-	case result := <-done:
-		if result.panic != nil {
-			return fmt.Errorf("direct read: panic: %v", result.panic)
-		}
-		if !result.ok {
-			return errors.New("direct read: outlet rejected an event")
-		}
-		return nil
-	case <-ctx.Done():
-		return directDeliveryAbort(ctx.Err())
+	if !input.outlet.OnEvent(&util.Data{Event: event}) {
+		return errors.New("direct read: outlet rejected an event")
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return directDeliveryAbort(ctxErr)
+	}
+	return nil
 }
 
 func directDeliveryAbort(err error) error {

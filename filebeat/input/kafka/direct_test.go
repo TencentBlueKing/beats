@@ -35,6 +35,7 @@ import (
 	"github.com/elastic/beats/filebeat/channel"
 	filebeatinput "github.com/elastic/beats/filebeat/input"
 	"github.com/elastic/beats/filebeat/util"
+	"github.com/elastic/beats/libbeat/beat"
 	"github.com/elastic/beats/libbeat/logp"
 )
 
@@ -692,11 +693,14 @@ func TestDirectReadConsumerErrorIsNotTimeoutSuccess(t *testing.T) {
 	assert.Contains(t, err.Error(), "offset out of range")
 }
 
-func TestDirectReadBlockedOutletTimesOut(t *testing.T) {
+// TestDirectReadBlockedOutletDeliversBeforeCompletion is the regression test
+// for the per-event delivery goroutine: when the outlet blocks past the
+// deadline, the preview must not close Completion() before OnEvent returns.
+// The blocked event is still delivered (the outlet was already inside
+// OnEvent), and no event may be delivered after the completion signal.
+func TestDirectReadBlockedOutletDeliversBeforeCompletion(t *testing.T) {
 	cfg := directTestConfig(10, 80*time.Millisecond)
-	release := make(chan struct{})
-	defer close(release)
-	outlet := &blockingOutlet{started: make(chan struct{}), release: release}
+	outlet := newOrderedBlockingOutlet()
 
 	consumer := newFakeDirectConsumer()
 	consumer.topics["test-topic"] = []int32{0}
@@ -706,12 +710,65 @@ func TestDirectReadBlockedOutletTimesOut(t *testing.T) {
 	})
 	consumer.addMessages("test-topic", 0, "blocked")
 
-	start := time.Now()
-	err := runDirectToCompletion(t, input)
+	input.Run()
+	select {
+	case <-outlet.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the outlet never received an event")
+	}
+	// Let the preview deadline expire while OnEvent is still blocked. The
+	// preview is allowed to wait here: bkunify's abort/StopPublish is the
+	// component that releases a blocked outlet.
+	time.Sleep(120 * time.Millisecond)
+	close(outlet.release)
+
+	select {
+	case <-input.completion:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the preview did not complete after the outlet was released")
+	}
+	outlet.markCompleted()
+
+	err := input.CompletionErr()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "timed out delivering")
-	assert.True(t, time.Since(start) < time.Second,
-		"blocked outlet abort took %s, want less than 1s", time.Since(start))
+
+	delivered, late, lastDelivery, completedAt := outlet.snapshot()
+	assert.Equal(t, 1, delivered, "the blocked event must still be delivered")
+	assert.Equal(t, 0, late, "no event may be delivered after Completion")
+	assert.True(t, !lastDelivery.After(completedAt),
+		"last delivery %s must not be after completion %s", lastDelivery, completedAt)
+
+	// Give a leftover delivery goroutine the chance to run: the completed
+	// preview must not deliver anything else.
+	time.Sleep(100 * time.Millisecond)
+	delivered, late, _, _ = outlet.snapshot()
+	assert.Equal(t, 1, delivered)
+	assert.Equal(t, 0, late)
+}
+
+// TestDirectReadNoEventsAfterCompletion checks the normal max_events exit:
+// Completion() is only closed after the last event was delivered and no event
+// follows it.
+func TestDirectReadNoEventsAfterCompletion(t *testing.T) {
+	cfg := directTestConfig(2, 2*time.Second)
+	outlet := &sequenceOutlet{}
+
+	consumer := newFakeDirectConsumer()
+	consumer.topics["test-topic"] = []int32{0}
+	consumer.partitions["test-topic/0"] = newFakePartitionConsumer()
+	input := newDirectTestInput(t, cfg, outlet, func(addrs []string, conf *sarama.Config) (directConsumer, error) {
+		return consumer, nil
+	})
+	consumer.addMessages("test-topic", 0, "one", "two", "three", "four")
+
+	require.NoError(t, runDirectToCompletion(t, input))
+	outlet.markCompleted()
+	time.Sleep(100 * time.Millisecond)
+
+	delivered, late := outlet.snapshot()
+	assert.Equal(t, 2, delivered, "the preview must stop at max_events")
+	assert.Equal(t, 0, late, "no event may be delivered after Completion")
 }
 
 // TestDirectReadMissingTopicFailsBeforePartitions covers the typo and deleted
@@ -828,6 +885,18 @@ func TestDirectReadAbortReturnsBeforeLateCleanup(t *testing.T) {
 	assert.Equal(t, 1, closeCalls, "the late cleanup must close the consumer exactly once")
 }
 
+func TestPublishDirectEventSkipsExpiredContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	outlet := &fakeOutlet{}
+	input := &kafkaInput{outlet: outlet}
+	err := input.publishDirectEvent(ctx, beat.Event{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "canceled while delivering")
+	assert.Equal(t, 0, outlet.count())
+}
+
 func TestDirectReadPanicCompletes(t *testing.T) {
 	cfg := directTestConfig(1, time.Second)
 	consumer := newFakeDirectConsumer()
@@ -869,19 +938,89 @@ func TestDirectReadStopWaitsForCompletion(t *testing.T) {
 	assert.Contains(t, input.CompletionErr().Error(), "canceled")
 }
 
-type blockingOutlet struct {
+type orderedBlockingOutlet struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+
+	mu          sync.Mutex
+	events      int
+	deliveredAt []time.Time
+	completed   bool
+	completedAt time.Time
+	lateEvents  int
 }
 
-func (o *blockingOutlet) OnEvent(*util.Data) bool {
+func newOrderedBlockingOutlet() *orderedBlockingOutlet {
+	return &orderedBlockingOutlet{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (o *orderedBlockingOutlet) OnEvent(*util.Data) bool {
 	o.once.Do(func() { close(o.started) })
 	<-o.release
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.completed {
+		o.lateEvents++
+	}
+	o.events++
+	o.deliveredAt = append(o.deliveredAt, time.Now())
 	return true
 }
-func (o *blockingOutlet) Close() error          { return nil }
-func (o *blockingOutlet) Done() <-chan struct{} { return nil }
+
+func (o *orderedBlockingOutlet) Close() error          { return nil }
+func (o *orderedBlockingOutlet) Done() <-chan struct{} { return nil }
+
+func (o *orderedBlockingOutlet) markCompleted() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.completed = true
+	o.completedAt = time.Now()
+}
+
+func (o *orderedBlockingOutlet) snapshot() (int, int, time.Time, time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	var last time.Time
+	if len(o.deliveredAt) > 0 {
+		last = o.deliveredAt[len(o.deliveredAt)-1]
+	}
+	return o.events, o.lateEvents, last, o.completedAt
+}
+
+type sequenceOutlet struct {
+	mu        sync.Mutex
+	events    int
+	completed bool
+	late      int
+}
+
+func (o *sequenceOutlet) OnEvent(*util.Data) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.completed {
+		o.late++
+	}
+	o.events++
+	return true
+}
+func (o *sequenceOutlet) Close() error          { return nil }
+func (o *sequenceOutlet) Done() <-chan struct{} { return nil }
+
+func (o *sequenceOutlet) markCompleted() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.completed = true
+}
+
+func (o *sequenceOutlet) snapshot() (int, int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.events, o.late
+}
 
 // slowCleanupConsumer is a broker whose synchronous ConsumePartition calls are
 // still queued when the preview deadline fires and whose Close is slower than
